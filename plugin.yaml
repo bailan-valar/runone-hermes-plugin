@@ -10,24 +10,19 @@ description: >
 author: RunOne
 requires_env:
   - name: RUNONE_BASE_URL
-    description: "RunOne API base URL (no trailing slash)"
-    prompt: "RunOne API base URL"
-    url: "https://runone-api.capdien.site"
-    password: false
+    description: "RunOne API base URL (no trailing slash). Production: https://runone-api.capdien.site ; local dev: http://127.0.0.1:8787"
+    secret: false
   - name: RUNONE_TOKEN
-    description: "RunOne personal access token (rn_…) used by Hermes"
-    prompt: "RunOne PAT"
-    password: true
+    description: "RunOne personal access token (rn_…) used by Hermes — create it in RunOne 设置 → 个人访问令牌"
+    secret: true
+    url: "https://project.capdien.site/settings"
 optional_env:
   - name: RUNONE_HOME_CONVERSATION
     description: "Default conversation id for cron / notification delivery"
-    prompt: "Home conversation id (or empty)"
-    password: false
+    secret: false
   - name: RUNONE_ALLOWED_USERS
     description: "Comma-separated RunOne account ids allowed to talk to the agent"
-    prompt: "Allowed users (comma-separated)"
-    password: false
+    secret: false
   - name: RUNONE_ALLOW_ALL_USERS
     description: "Allow any RunOne account (dev only — disables the allowlist)"
-    prompt: "Allow all users? (true/false)"
-    password: false
+    secret: false
