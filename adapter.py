@@ -364,17 +364,28 @@ def is_connected(config: Any = None) -> bool:
     return env_is_connected("RUNONE_BASE_URL", "RUNONE_TOKEN")(config)
 
 
-def validate_config(config: Any = None) -> Optional[str]:
-    """返回错误文案则视为配置不合法（哨兵检查，不抛异常）。"""
+def validate_config(config: Any = None) -> bool:
+    """配置是否合法。
+
+    ⚠ **返回 True 才算合法**：Hermes 网关把本钩子当布尔谓词用
+    （`if not entry.validate_config(config): logger.warning("config validation failed"); return None`）。
+    早先写成「返回错误文案表示不合法、正常返回 None」，结果配置正确时反而被判失败、
+    适配器从来没被创建过（`Gateway running with 4 platform(s)`、日志里只有
+    「Platform 'RunOne' config validation failed」）。所以这里只回 bool，原因自己打日志。
+    """
     import os
 
     base = (os.getenv("RUNONE_BASE_URL") or "").strip()
     token = (os.getenv("RUNONE_TOKEN") or "").strip()
     if base.startswith("http://") and "127.0.0.1" not in base and "localhost" not in base:
-        return "RUNONE_BASE_URL 用明文 http 且不是本机地址 —— 请用 https（PAT 会明文过网）"
+        logger.warning(
+            "[%s] RUNONE_BASE_URL 用明文 http 且不是本机地址 —— 请用 https（PAT 会明文过网）", PLATFORM_NAME
+        )
+        return False
     if token and not token.startswith("rn_"):
-        return "RUNONE_TOKEN 看起来不是 RunOne 的 PAT（应以 rn_ 开头）"
-    return None
+        logger.warning("[%s] RUNONE_TOKEN 看起来不是 RunOne 的 PAT（应以 rn_ 开头）", PLATFORM_NAME)
+        return False
+    return True
 
 
 def _env_enablement() -> Dict[str, Any]:
