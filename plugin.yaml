@@ -1,0 +1,33 @@
+name: runone-platform
+label: RunOne
+kind: platform
+version: 0.1.0
+description: >
+  RunOne gateway adapter for Hermes Agent (draft for docs/ai-channel-design.md).
+  RunOne acts as a chat platform: Hermes polls the RunOne API outbound
+  (long-poll /ai/inbox) and writes replies back (/ai/messages/:id/reply).
+  No inbound exposure, no tunnel — RunOne's own API stays the only surface.
+author: RunOne
+requires_env:
+  - name: RUNONE_BASE_URL
+    description: "RunOne API base URL (no trailing slash)"
+    prompt: "RunOne API base URL"
+    url: "https://runone-api.capdien.site"
+    password: false
+  - name: RUNONE_TOKEN
+    description: "RunOne personal access token (rn_…) used by Hermes"
+    prompt: "RunOne PAT"
+    password: true
+optional_env:
+  - name: RUNONE_HOME_CONVERSATION
+    description: "Default conversation id for cron / notification delivery"
+    prompt: "Home conversation id (or empty)"
+    password: false
+  - name: RUNONE_ALLOWED_USERS
+    description: "Comma-separated RunOne account ids allowed to talk to the agent"
+    prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: RUNONE_ALLOW_ALL_USERS
+    description: "Allow any RunOne account (dev only — disables the allowlist)"
+    prompt: "Allow all users? (true/false)"
+    password: false
