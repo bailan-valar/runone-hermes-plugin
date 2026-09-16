@@ -46,6 +46,18 @@ from gateway.platforms.helpers import MessageDeduplicator
 logger = logging.getLogger(__name__)
 
 PLATFORM_NAME = "runone"
+
+
+def _audio_mime(name: str) -> str:
+    """按扩展名给 MIME：语音附件用（COS 直传要在 presign 时定 mime）。"""
+    return {
+        ".mp3": "audio/mpeg",
+        ".m4a": "audio/mp4",
+        ".wav": "audio/wav",
+        ".ogg": "audio/ogg",
+        ".opus": "audio/ogg",
+        ".webm": "audio/webm",
+    }.get(Path(name).suffix.lower(), "application/octet-stream")
 MAX_MESSAGE_LENGTH = 8000
 
 # 长轮询：服务端最多挂 WAIT 秒（设计文档 §5-1 口径），客户端超时留足余量
@@ -270,17 +282,6 @@ class RunoneAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="RunOne 写入失败（详见网关日志）", retryable=True)
         self._reply_anchor.pop(str(chat_id), None)  # 一条入站消息一条回复
         return SendResult(success=True, message_id=str(data.get("id") or ""), raw_response=data)
-
-    def _audio_mime(name: str) -> str:
-        """按扩展名给 MIME：语音附件用（COS 直传要在 presign 时定 mime）。"""
-        return {
-            ".mp3": "audio/mpeg",
-            ".m4a": "audio/mp4",
-            ".wav": "audio/wav",
-            ".ogg": "audio/ogg",
-            ".opus": "audio/ogg",
-            ".webm": "audio/webm",
-        }.get(Path(name).suffix.lower(), "application/octet-stream")
 
     async def send_voice(
         self,
