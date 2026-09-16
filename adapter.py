@@ -311,7 +311,8 @@ class RunoneAdapter(BasePlatformAdapter):
         name = source.name or "voice.mp3"
         presign = await self._post(
             "/attachments/presign",
-            {"name": name, "size": len(audio), "mimeType": _audio_mime(name)},
+            # conversationId 是必须的：AI 对话的附件没有项目归属，服务端按会话可见性授权
+            {"name": name, "size": len(audio), "mimeType": _audio_mime(name), "conversationId": chat_id},
         )
         if not presign or not presign.get("uploadUrl"):
             logger.warning("[%s] voice: 预签名失败（%s）", self.name, name)
