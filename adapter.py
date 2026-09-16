@@ -26,6 +26,7 @@ import asyncio
 import logging
 import random
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:  # httpx 是 Hermes 自带依赖；缺失时平台整体不可用（照 ntfy 的处理）
@@ -265,6 +266,78 @@ class RunoneAdapter(BasePlatformAdapter):
         self._reply_anchor.pop(str(chat_id), None)  # 一条入站消息一条回复
         return SendResult(success=True, message_id=str(data.get("id") or ""), raw_response=data)
 
+    def _audio_mime(name: str) -> str:
+        """按扩展名给 MIME：语音附件用（COS 直传要在 presign 时定 mime）。"""
+        return {
+            ".mp3": "audio/mpeg",
+            ".m4a": "audio/mp4",
+            ".wav": "audio/wav",
+            ".ogg": "audio/ogg",
+            ".opus": "audio/ogg",
+            ".webm": "audio/webm",
+        }.get(Path(name).suffix.lower(), "application/octet-stream")
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """语音回复 = **音频附件**（照抄 Telegram/Discord 的路线，不做实时流）。
+
+        顺序：预签名 → 直传 COS → complete → 往会话写一条 assistant 消息挂上附件。
+        为什么不走 `/ai/messages/:id/reply` 那个锚点：语音常常**先于**文本回复发出，
+        用 reply 锚点会把入站消息提前置成 replied，随后真正的文本回复就被幂等键判成重复、发不出去。
+        """
+        if self._http is None:
+            return SendResult(success=False, error="adapter 未连接")
+        try:
+            source = Path(audio_path)
+            audio = source.read_bytes()
+        except OSError as exc:
+            logger.warning("[%s] voice: 读取音频失败：%s", self.name, exc)
+            return SendResult(success=False, error=f"读取音频失败：{exc}")
+        if not audio:
+            return SendResult(success=False, error="音频为空")
+
+        name = source.name or "voice.mp3"
+        presign = await self._post(
+            "/attachments/presign",
+            {"name": name, "size": len(audio), "mimeType": _audio_mime(name)},
+        )
+        if not presign or not presign.get("uploadUrl"):
+            logger.warning("[%s] voice: 预签名失败（%s）", self.name, name)
+            return SendResult(success=False, error="附件预签名失败", retryable=True)
+        attachment_id = str(presign.get("id") or "")
+        try:
+            res = await self._http.put(
+                presign["uploadUrl"], content=audio, headers=presign.get("headers") or {}
+            )
+            res.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] voice: 上传 COS 失败：%s", self.name, exc)
+            return SendResult(success=False, error="音频上传失败", retryable=True)
+        if attachment_id and await self._request("PATCH", f"/attachments/{attachment_id}/complete", {}) is None:
+            return SendResult(success=False, error="附件 complete 失败", retryable=True)
+
+        data = await self._request(
+            "POST",
+            f"/ai/conversations/{chat_id}/messages",
+            {
+                "role": "assistant",
+                "text": (caption or "").strip(),
+                "attachmentIds": [attachment_id] if attachment_id else [],
+                "clientMsgId": f"hermes-voice-{uuid.uuid4().hex}",
+            },
+        )
+        if data is None:
+            return SendResult(success=False, error="RunOne 写入语音消息失败", retryable=True)
+        logger.info("[%s] voice: 已投递音频附件 %s（%d 字节）", self.name, attachment_id, len(audio))
+        return SendResult(success=True, message_id=str(data.get("id") or ""), raw_response=data)
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """typing 是心跳式的：服务端 5s 过期，网关的 _keep_typing 每 2s 会调到这里。"""
         await self._post(f"/ai/conversations/{chat_id}/typing", {}) if self._http else None
@@ -423,7 +496,9 @@ def register(ctx) -> None:
         platform_hint=(
             "You are replying inside RunOne（用户的个人任务管理应用）的 AI 助手页。"
             "回复用简洁中文，可以带轻 markdown（列表、加粗、行内代码）；"
-            "任务读写一律通过 mcp__runone__* 工具，不要凭记忆回答任务内容。"
+            "任务/目标/指标的读写一律用 runone 工具集"
+            "（list_today_tasks、find_tasks、create_task、update_task、list_goals、add_metric_record 等），"
+            "不要凭记忆回答任务内容。"
         ),
         allow_update_command=True,
     )

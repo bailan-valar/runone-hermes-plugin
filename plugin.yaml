@@ -1,19 +1,55 @@
 name: runone-platform
 label: RunOne
 kind: platform
-version: 0.1.0
+version: 0.2.0
 description: >
-  RunOne gateway adapter for Hermes Agent (draft for docs/ai-channel-design.md).
-  RunOne acts as a chat platform: Hermes polls the RunOne API outbound
-  (long-poll /ai/inbox) and writes replies back (/ai/messages/:id/reply).
-  No inbound exposure, no tunnel — RunOne's own API stays the only surface.
+  RunOne plugin for Hermes Agent — two things behind one credential:
+
+  INBOUND (platform adapter): RunOne's AI assistant page acts as a chat platform.
+  Hermes polls the RunOne API outbound (long-poll /ai/inbox) and writes replies
+  back (/ai/messages/:id/reply). No inbound exposure, no tunnel — RunOne's own
+  API stays the only surface.
+
+  OUTBOUND (tools): the same RunOne operations as a native 'runone' toolset
+  (list_today_tasks, create_task, update_goal, add_metric_record, ... 22 tools),
+  so the agent can read and write tasks, goals, metrics and recurrences in any
+  session. Schemas are generated from the server's /mcp catalog, so the plugin
+  and the MCP endpoint never drift; execution reuses the server-side
+  implementations, which keeps attribution, change notes and permissions
+  identical whichever way the tools are reached.
 author: RunOne
+# The tool names this plugin registers. Declaring them is what asks plugin
+# discovery to import tools.py at discovery time, so the tools also register in
+# CLI/TUI processes (where the platform adapter itself stays deferred).
+provides_tools:
+  - list_today_tasks
+  - list_projects
+  - list_assigned_tasks
+  - take_task
+  - submit_task_result
+  - find_tasks
+  - create_task
+  - complete_task
+  - update_task
+  - create_goal
+  - list_goals
+  - link_task_to_goal
+  - update_goal
+  - create_metric
+  - list_metrics
+  - add_metric_record
+  - list_metric_records
+  - create_recurrence
+  - list_recurrences
+  - update_recurrence
+  - skip_occurrence
+  - list_my_account
 requires_env:
   - name: RUNONE_BASE_URL
     description: "RunOne API base URL (no trailing slash). Production: https://runone-api.capdien.site ; local dev: http://127.0.0.1:8787"
     secret: false
   - name: RUNONE_TOKEN
-    description: "RunOne personal access token (rn_…) used by Hermes — create it in RunOne 设置 → 个人访问令牌"
+    description: "RunOne personal access token (rn_…) used by Hermes — create it in RunOne 设置 → 个人访问令牌. One token covers both the chat channel and the task/goal tools."
     secret: true
     url: "https://project.capdien.site/settings"
 optional_env:
