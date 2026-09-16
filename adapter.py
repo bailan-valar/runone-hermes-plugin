@@ -166,7 +166,12 @@ class RunoneAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
-                logger.warning("[%s] poll failed (%s); retrying in %.1fs", self.name, exc, backoff)
+                # 带上异常类型：httpx 的 ReadError/RemoteProtocolError 常常是空消息，
+                # 只打 str(exc) 会得到「poll failed ()」这种没法定位的日志。
+                logger.warning(
+                    "[%s] poll failed (%s: %s); retrying in %.1fs",
+                    self.name, type(exc).__name__, exc, backoff,
+                )
                 await asyncio.sleep(backoff + random.uniform(0, backoff / 4))
                 backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
 
