@@ -103,6 +103,9 @@ class RunoneAdapter(BasePlatformAdapter):
         self._dedup = MessageDeduplicator(max_size=DEDUP_MAX_SIZE, ttl_seconds=DEDUP_WINDOW_SECONDS)
         # chat_id(会话 id) → 当前正在回复的那条用户消息 id，send() 用它走 /reply 拿幂等
         self._reply_anchor: Dict[str, str] = {}
+        # chat_id(会话 id) → 该会话是否「AI 回复带语音」。开关注在服务端（会话列），
+        # 随 inbox 投递下来；关掉时 send_voice 直接不发，连生成都省掉。
+        self._voice_enabled: Dict[str, bool] = {}
 
     # ---- 连接生命周期 -------------------------------------------------------
 
@@ -154,6 +157,7 @@ class RunoneAdapter(BasePlatformAdapter):
         await self._teardown()
         self._dedup = MessageDeduplicator(max_size=DEDUP_MAX_SIZE, ttl_seconds=DEDUP_WINDOW_SECONDS)
         self._reply_anchor.clear()
+        self._voice_enabled.clear()
         logger.info("[%s] Disconnected", self.name)
 
     async def _teardown(self) -> None:
@@ -238,6 +242,8 @@ class RunoneAdapter(BasePlatformAdapter):
         author_id = item.get("authorUserId") or item.get("author_user_id") or ""
         author_name = item.get("authorName") or item.get("author_name")
         self._reply_anchor[conversation_id] = message_id
+        # 「AI 回复带语音」由服务端按会话存（默认开）；旧后端不带这个字段时按开处理
+        self._voice_enabled[conversation_id] = item.get("voiceReplies") is not False
 
         event = MessageEvent(
             text=text,
@@ -300,6 +306,11 @@ class RunoneAdapter(BasePlatformAdapter):
         """
         if self._http is None:
             return SendResult(success=False, error="adapter 未连接")
+        # 会话里关掉了「AI 回复带语音」：不发。返回 success 而不是失败——
+        # 这是用户的选择，不是投递出错，网关不该把它报成错误。
+        if not self._voice_enabled.get(str(chat_id), True):
+            logger.debug("[%s] voice replies disabled for %s — skipped", self.name, chat_id)
+            return SendResult(success=True, message_id="")
         try:
             source = Path(audio_path)
             audio = source.read_bytes()
