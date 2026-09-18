@@ -2,13 +2,14 @@
 
 一个插件，两件事，一份凭据：
 
-* **入站对话通道**（`kind: platform`）—— RunOne 的 AI 助手页当成一个聊天平台。Hermes **主动出站**长轮询取消息、回写回复，**不需要内网穿透、不需要常驻服务**。
+* **入站对话通道**（`kind: platform`）—— RunOne 的 AI 助手页当成一个聊天平台。Hermes **主动出站**接一条 WebSocket（`/ai/inbox/ws`，服务端 Durable Object）收推送、并把消息拉回来；连不上就自动退回长轮询。**不需要内网穿透、不需要你在自己机器上跑常驻服务**。
 * **出站工具集**（`provides_tools`）—— 任务 / 目标 / 指标 / 重复任务等 **22 个工具**，agent 在任何会话里都能读写 RunOne。
 
 ```
 RunOne 前端 /ai ──► RunOne Worker + D1（消息、任务与权限的唯一真相）
                             ▲
-                            │ GET  /ai/inbox?cursor&wait=25   （长轮询，出站）
+                            │ WS   /ai/inbox/ws                （推送面，出站；只发 kick 信号）
+                            │ GET  /ai/inbox?cursor&wait=0      （收到 kick 后拉一次；每 60s 兜底拉一次）
                             │ POST /ai/messages/:id/claim     （认领 + 90s 租约）
                             │ POST /ai/messages/:id/heartbeat （租约续期，搭在 typing 心跳上）
                             │ POST /ai/messages/:id/reply     （回写，幂等；语音附件与正文同一条）
@@ -20,6 +21,9 @@ RunOne 前端 /ai ──► RunOne Worker + D1（消息、任务与权限的唯�
                             │ POST /mcp  tools/call（同一枚 PAT）
                             └──► RunOne 服务端工具实现
 ```
+
+推送面不可用时（服务端版本旧 / 没部署 / `websockets` 库缺失 / `RUNONE_WS=0`）自动退回
+`GET /ai/inbox?wait=25` 的长轮询 —— 功能一模一样，只是回到「每秒重查」的老成本上。
 
 平台这一侧与 Telegram（HTTP 长轮询）、企业微信 / Discord（WS 客户端）、飞书（SDK 长连接）**同一类**：都是出站客户端。
 
@@ -69,7 +73,7 @@ hermes -p worker plugins install bailan-valar/runone-hermes-plugin --enable
 | 文件 | 作用 |
 |---|---|
 | `plugin.yaml` | 清单：`kind: platform`、`provides_tools`（22 个工具名）、`requires_env` |
-| `adapter.py` | 对话通道（~380 行）：长轮询 + 入站投递 + send/typing/get_chat_info + cron 投递 + `register(ctx)` |
+| `adapter.py` | 对话通道（~700 行）：推送面（WSS）+ 长轮询兜底 + 入站投递 + send/typing/get_chat_info + cron 投递 + `register(ctx)` |
 | `tools.py` | 工具集：传输（`/mcp` 转发）、错误映射、结果渲染、`register_tools(ctx)` |
 | `catalog.py` | **自动生成**的工具目录（勿手改） |
 | `scripts/gen_catalog.py` | 重新生成 `catalog.py`（打 `/mcp` `tools/list`） |
@@ -79,8 +83,11 @@ hermes -p worker plugins install bailan-valar/runone-hermes-plugin --enable
 
 | 方法 | 做什么 |
 |---|---|
-| `connect()` | 建 httpx 客户端（Bearer PAT）→ 起 `_poll_loop` → `_mark_connected()` |
-| `_poll_loop()` / `_poll_once()` | 长轮询 `/ai/inbox`；指数退避 + 抖动重连；**游标只在整批投递成功后推进**（不丢消息） |
+| `connect()` | 建 httpx 客户端（Bearer PAT）→ 起 `_ingress_loop` → `_mark_connected()` |
+| `_ingress_loop()` | 入站总调度：**推送模式优先**（连 `/ai/inbox/ws`），服务端没有这条路由 / 连续连不上 / `websockets` 缺失 / `RUNONE_WS=0` 时退回长轮询 |
+| `_ws_session()` | 一次推送会话：连上先对一次账 → 每个 `{"type":"kick"}` 拉一次；保活走协议级 ping/pong（20s），超时即重连 |
+| `_safety_loop()` | 挂着推送时每 60s 单次拉一次（`wait=0`）：防漏 kick + 服务端「在线」打点 + stale 扫尾。`RUNONE_WS_SAFETY_POLL_SECONDS=0` 可关 |
+| `_poll_once(wait)` / `_fetch_and_deliver()` | `/ai/inbox`；指数退避 + 抖动重连；**游标只在整批投递成功后推进**（不丢消息）；两条拉取路径用锁串行化 |
 | `_deliver(item)` | 去重 → `claim` → `build_source()` 造 `MessageEvent` → `handle_message()`（先认领后干活） |
 | `send(chat_id, text)` | 有入站锚点走 `/ai/messages/:id/reply`（带 `clientMsgId` 幂等键），无锚点（cron）直接写 assistant 消息；**被拒 409（租约过期）时先重新 `claim` 再用同一个幂等键重放一次** |
 | `send_voice(chat_id, audio)` | 上传音频 → **不单独发消息**，把附件 ID 挂给紧随其后的 `send()`（正文与语音同一条）；等不到正文（60s）由 `_flush_stale_voice` 兜底单独投递 |

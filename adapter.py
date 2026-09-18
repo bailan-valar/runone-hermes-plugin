@@ -6,12 +6,21 @@
 
     前端 /ai ──POST /ai/… ──► RunOne Worker + D1（消息与权限的唯一真相）
                                         ▲
-                                        │ 长轮询 GET /ai/inbox?cursor&wait=25
+                                        │ 推送 GET /ai/inbox/ws（WSS，只发 kick 信号）★ 主用
+                                        │ 拉取 GET /ai/inbox?cursor&wait=0（收到 kick 后 / 每 60s 兜底）
                                         │ 认领 POST /ai/messages/:id/claim
                                         │ 回写 POST /ai/messages/:id/reply
                                         │ 心跳 POST /ai/conversations/:id/typing
                                         │
                                  本适配器（跑在 Hermes 网关进程里）
+
+入站有**两种模式，契约与游标语义完全一样**（都走 `/ai/inbox`），区别只在「什么时候去拉」：
+
+* **推送模式（默认）**：连 `GET /ai/inbox/ws`（服务端是 Durable Object），消息落库即被 kick
+  一下 → 立刻拉一次。空闲时不再每秒重查 —— 老的长轮询是 30,556 次查询 / 466 万行读每天
+  （占 D1 免费额度 86%，打满后整站 500）。
+* **长轮询模式（兜底）**：服务端没有这条路由（旧版本 / 还没部署）、`websockets` 库缺失、
+  `RUNONE_WS=0`、或连续连不上时自动退到它 —— 功能不降级，只是回到「挂着 wait=25 等」。
 
 骨架照 `plugins/platforms/ntfy/adapter.py`（HTTP 传输 + 退避重连）抄，与之并列的还有
 telegram（HTTP 长轮询）、wecom / discord（WS 客户端）、feishu（SDK 长连接）。
@@ -23,12 +32,15 @@ telegram（HTTP 长轮询）、wecom / discord（WS 客户端）、feishu（SDK 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import logging
 import random
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 try:  # httpx 是 Hermes 自带依赖；缺失时平台整体不可用（照 ntfy 的处理）
     import httpx
@@ -37,6 +49,14 @@ try:  # httpx 是 Hermes 自带依赖；缺失时平台整体不可用（照 ntf
 except ImportError:  # pragma: no cover
     httpx = None  # type: ignore[assignment]
     HTTPX_AVAILABLE = False
+
+try:  # 推送面（WSS）用；缺失时自动退长轮询，功能不受影响
+    import websockets
+
+    WEBSOCKETS_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    websockets = None  # type: ignore[assignment]
+    WEBSOCKETS_AVAILABLE = False
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms._shared import extra_or_secret, get_scoped_secret
@@ -61,9 +81,32 @@ def _audio_mime(name: str) -> str:
     }.get(Path(name).suffix.lower(), "application/octet-stream")
 MAX_MESSAGE_LENGTH = 8000
 
+# Cloudflare 前置会按浏览器指纹拒掉裸 UA（仓库里踩过 1010）——HTTP 与 WS 都用这一个标识
+USER_AGENT = "HermesAgent-RunoneAdapter/0.4"
+
+# ---- 传输：推送面（WSS）优先，长轮询兜底 ------------------------------------
+#
+# 契约不变：推送只发 `{"type":"kick"}`，消息本体仍从 `/ai/inbox` 拉
+# （项目上下文注入、成员/空间收窄、游标语义都留在服务端那一份实现里）。
 # 长轮询：服务端最多挂 WAIT 秒（设计文档 §5-1 口径），客户端超时留足余量
 POLL_WAIT_SECONDS = 25
 POLL_TIMEOUT_SECONDS = 40
+# 挂着推送时的「兜底拉取」间隔（秒）：定期单次拉一次（wait=0），做三件事 ——
+# 防漏 kick、给服务端「Hermes 在线」打点、顺手跑 stale 扫尾。
+# 服务端判在线的有效期是 150s（AI_AGENT_SEEN_TTL_SECONDS = 2.5 × 这个间隔）。0 = 关掉（只靠 kick）
+WS_SAFETY_POLL_SECONDS_DEFAULT = 60.0
+# WS 保活走协议级 ping/pong（服务端 runtime 自动回，不唤醒 Durable Object）：
+# ping_interval 内没等到 pong 就抛异常 → 断开 → 上层重连（这就是「链路死了」的判据）
+WS_PING_INTERVAL_SECONDS = 20.0
+WS_PING_TIMEOUT_SECONDS = 20.0
+WS_OPEN_TIMEOUT_SECONDS = 15.0
+WS_CLOSE_TIMEOUT_SECONDS = 5.0
+WS_MAX_FRAME_BYTES = 64 * 1024
+# 一次会话短于这个秒数就当「没连上 / 被立刻关掉」，按失败计入退避（防重连风暴）
+WS_MIN_SESSION_SECONDS = 5.0
+# 连续失败几次之后先回长轮询一段时间再试（服务端还没部署推送面时的常态）
+WS_FALLBACK_AFTER_FAILURES = 3
+WS_RETRY_AFTER_SECONDS = 300.0
 # 重连退避（指数 + 抖动），照 base 文档的「streaming 连接必须带退避」要求
 BACKOFF_START_SECONDS = 1.0
 BACKOFF_MAX_SECONDS = 60.0
@@ -81,12 +124,29 @@ DEDUP_MAX_SIZE = 2000
 DEDUP_WINDOW_SECONDS = 600
 
 
+class WsUnsupported(RuntimeError):
+    """服务端没有推送面（路由不存在 / 不是 WebSocket 端点）——不是故障，退回长轮询即可。"""
+
+
+def _truthy(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _setting(extra: Dict[str, Any], *keys: str, env: str = "", default: str = "") -> str:
     """config.yaml 的 platforms.runone.extra 优先，其次环境变量（与 wecom/ntfy 同款）。"""
     return str(
         next((extra[k] for k in keys if extra.get(k)), None)
         or (get_scoped_secret(env, default) if env else "")
     ).strip()
+
+
+def _float_setting(extra: Dict[str, Any], *keys: str, env: str = "", default: float) -> float:
+    """数值型配置：写坏了就回默认值（配置错误不该让适配器起不来）。"""
+    raw = _setting(extra, *keys, env=env, default=str(default))
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
 
 
 class RunoneAdapter(BasePlatformAdapter):
@@ -97,12 +157,26 @@ class RunoneAdapter(BasePlatformAdapter):
         self._token: str = _setting(extra, "token", env="RUNONE_TOKEN")
         # 默认 **不继承系统代理**：Windows 上 httpx 会从注册表读到 Clash 之类的系统代理，
         # 连 127.0.0.1 也会被劫持成 502（本机实测）。要经代理访问 RunOne 时显式打开。
-        self._trust_env: bool = _setting(
-            extra, "use_system_proxy", "useSystemProxy", env="RUNONE_USE_SYSTEM_PROXY", default="0"
-        ).lower() in {"1", "true", "yes", "on"}
+        self._trust_env: bool = _truthy(
+            _setting(extra, "use_system_proxy", "useSystemProxy", env="RUNONE_USE_SYSTEM_PROXY", default="0")
+        )
+        # 推送面（WSS）：默认开。`RUNONE_WS=0` 强制回长轮询；服务端没有这条路由时也会自动退。
+        self._ws_enabled: bool = _truthy(_setting(extra, "ws", "push", env="RUNONE_WS", default="1"))
+        self._ws_safety_poll_seconds: float = _float_setting(
+            extra,
+            "ws_safety_poll_seconds",
+            env="RUNONE_WS_SAFETY_POLL_SECONDS",
+            default=WS_SAFETY_POLL_SECONDS_DEFAULT,
+        )
         self._http: Optional["httpx.AsyncClient"] = None
-        self._poll_task: Optional[asyncio.Task] = None
+        self._ingress_task: Optional[asyncio.Task] = None
         self._stopping = False
+        # 拉取串行化：kick 触发的拉取与兜底拉取可能同时想跑，两条一起拉会让同一条消息
+        # 走两次投递（服务端认领是原子的，能挡住重复处理，但没必要制造这种竞争）
+        self._poll_lock = asyncio.Lock()
+        self._ws_connected = False
+        self._ws_last_session_seconds = 0.0
+        self._kicks = 0
         # 内存游标：本会话已投递到的 seq（持久化在批二接 plugin_db，见 README「未做」）
         # inbox 游标：**不透明字符串**（服务端给 `<createdAt>|<id>`）。
         # 别自己拿 seq 当游标——seq 是会话内序号，跨会话比较会漏掉新会话的消息。
@@ -138,14 +212,22 @@ class RunoneAdapter(BasePlatformAdapter):
                 headers={
                     "Authorization": f"Bearer {self._token}",
                     "Accept": "application/json",
-                    # Cloudflare 前置会按浏览器指纹拒掉裸 UA（仓库里踩过 1010），带一个明确的标识：
-                    "User-Agent": "HermesAgent-RunoneAdapter/0.1",
+                    "User-Agent": USER_AGENT,
                 },
             )
             self._stopping = False
-            self._poll_task = asyncio.create_task(self._poll_loop())
+            self._ingress_task = asyncio.create_task(self._ingress_loop())
             self._mark_connected()
-            logger.info("[%s] Connected — long-polling %s/ai/inbox", self.name, self._base_url)
+            if self._ws_enabled and WEBSOCKETS_AVAILABLE:
+                logger.info(
+                    "[%s] Connected — 推送面 %s（连不上自动退长轮询 %s/ai/inbox）",
+                    self.name,
+                    self._ws_url(),
+                    self._base_url,
+                )
+            else:
+                reason = "websockets 未安装" if not WEBSOCKETS_AVAILABLE else "RUNONE_WS=0"
+                logger.info("[%s] Connected — 长轮询 %s/ai/inbox（%s）", self.name, self._base_url, reason)
             self._wire_plugin_handlers(None)  # ctx.register_platform_handler 钩子
             return True
         except Exception as exc:  # noqa: BLE001 — 连接失败要落成可读状态，不能抛出打断网关启动
@@ -156,7 +238,7 @@ class RunoneAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         self._stopping = True
         self._mark_disconnected()
-        task, self._poll_task = self._poll_task, None
+        task, self._ingress_task = self._ingress_task, None
         if task is not None:
             task.cancel()
             try:
@@ -164,8 +246,9 @@ class RunoneAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             except Exception:  # noqa: BLE001
-                logger.debug("[%s] poll task ended with error during shutdown", self.name, exc_info=True)
+                logger.debug("[%s] ingress task ended with error during shutdown", self.name, exc_info=True)
         await self._teardown()
+        self._ws_connected = False
         self._dedup = MessageDeduplicator(max_size=DEDUP_MAX_SIZE, ttl_seconds=DEDUP_WINDOW_SECONDS)
         self._reply_anchor.clear()
         self._voice_enabled.clear()
@@ -181,17 +264,62 @@ class RunoneAdapter(BasePlatformAdapter):
             except Exception:  # noqa: BLE001
                 logger.debug("[%s] closing HTTP client failed", self.name, exc_info=True)
 
-    # ---- 入站：长轮询 -------------------------------------------------------
+    # ---- 入站：推送（WSS）优先 + 长轮询兜底 ---------------------------------
 
-    async def _poll_loop(self) -> None:
-        """一直拉到 disconnect()；网络错误按指数退避重连（游标不前进＝不丢消息）。"""
+    async def _ingress_loop(self) -> None:
+        """入站总调度，一直跑到 disconnect()。
+
+        两种模式**契约与游标语义完全一样**（都走 `/ai/inbox`），区别只在「什么时候去拉」：
+        推送模式（连 `/ai/inbox/ws`，消息落库即 kick）优先；WS 不可用 / 连续失败时退回长轮询
+        （老行为：挂着 wait=25 等）。功能不降级，只是回到「每秒重查」的老成本上。
+        """
+        ws_mode = self._ws_enabled and WEBSOCKETS_AVAILABLE
+        if self._ws_enabled and not WEBSOCKETS_AVAILABLE:
+            logger.info("[%s] websockets 未安装 —— 用长轮询（装上它即可开推送模式）", self.name)
+        ws_failures = 0
+        ws_retry_at = 0.0  # 冷却期：连续失败后先回长轮询一段时间再试
         backoff = BACKOFF_START_SECONDS
+
         while not self._stopping:
+            if ws_mode and time.monotonic() >= ws_retry_at:
+                reason: Optional[str] = None
+                try:
+                    await self._ws_session()
+                except asyncio.CancelledError:
+                    raise
+                except WsUnsupported as exc:
+                    # 服务端还没部署推送面：不是故障，长期用长轮询
+                    logger.info("[%s] 服务端没有推送面（%s）—— 长期用长轮询", self.name, exc)
+                    ws_mode = False
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    reason = f"{type(exc).__name__}: {exc}"
+                lasted = self._ws_last_session_seconds
+                if reason is None and lasted >= WS_MIN_SESSION_SECONDS:
+                    ws_failures = 0
+                    backoff = BACKOFF_START_SECONDS
+                    continue
+                ws_failures += 1
+                logger.warning(
+                    "[%s] 推送连接结束（%s，持续 %.1fs）；%.1fs 后重连",
+                    self.name, reason or "服务端关闭", lasted, backoff,
+                )
+                if ws_failures >= WS_FALLBACK_AFTER_FAILURES:
+                    logger.info(
+                        "[%s] 推送面连续 %d 次连不上 —— 先回长轮询 %.0fs（%s/ai/inbox 一直可用）",
+                        self.name, ws_failures, WS_RETRY_AFTER_SECONDS, self._base_url,
+                    )
+                    ws_retry_at = time.monotonic() + WS_RETRY_AFTER_SECONDS
+                await asyncio.sleep(backoff + random.uniform(0, backoff / 4))
+                backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
+                # 断开期间落下的消息：立刻对一次账（失败只记日志，交给下一拍）
+                await self._safe_poll_once(0)
+                continue
+
+            # ---- 长轮询模式（老行为）----
             try:
-                delivered = await self._poll_once()
+                await self._poll_once(POLL_WAIT_SECONDS)
                 backoff = BACKOFF_START_SECONDS  # 一轮成功就重置退避
-                if delivered == 0:
-                    continue  # 空返回 = 服务端挂满 wait 秒，立刻再拉
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -204,11 +332,119 @@ class RunoneAdapter(BasePlatformAdapter):
                 await asyncio.sleep(backoff + random.uniform(0, backoff / 4))
                 backoff = min(backoff * 2, BACKOFF_MAX_SECONDS)
 
-    async def _poll_once(self) -> int:
+    async def _ws_session(self) -> None:
+        """一次推送会话：连上 → 先对一次账 → 之后每个 kick 拉一次；断开即返回或抛异常。
+
+        保活走 `websockets` 的**协议级 ping/pong**（服务端 runtime 自动回，既不唤醒 Durable
+        Object 也不产生计费请求）：一个 ping 周期内没等到 pong 就抛 ConnectionClosed，这就是
+        「链路已经死了」的判据 —— 比另加一条应用级心跳省得多。
+        """
+        if websockets is None:  # pragma: no cover — 调用方已按 WEBSOCKETS_AVAILABLE 判过
+            raise WsUnsupported("websockets 未安装")
+        url = self._ws_url()
+        if self._cursor:
+            # 游标只是给服务端排障展示用（推送本身不带载荷），带上可以看到「这条连接拉到哪了」
+            url = f"{url}?cursor={quote(self._cursor, safe='')}"
+        started = time.monotonic()
+        try:
+            async with websockets.connect(
+                url,
+                additional_headers={"Authorization": f"Bearer {self._token}"},
+                user_agent_header=USER_AGENT,
+                open_timeout=WS_OPEN_TIMEOUT_SECONDS,
+                ping_interval=WS_PING_INTERVAL_SECONDS,
+                ping_timeout=WS_PING_TIMEOUT_SECONDS,
+                close_timeout=WS_CLOSE_TIMEOUT_SECONDS,
+                max_size=WS_MAX_FRAME_BYTES,
+            ) as ws:
+                self._ws_connected = True
+                logger.info(
+                    "[%s] 推送模式已连上 %s（消息落库即到；每 %.0fs 兜底拉一次）",
+                    self.name, url.split("?")[0], self._ws_safety_poll_seconds,
+                )
+                await self._safe_poll_once(0)  # 断线 / 重连期间落下的消息，连上先对一次账
+                safety = asyncio.create_task(self._safety_loop())
+                try:
+                    async for raw in ws:
+                        if not self._is_kick(raw):
+                            continue
+                        self._kicks += 1
+                        logger.debug("[%s] push kick #%d → 拉一次 inbox", self.name, self._kicks)
+                        await self._safe_poll_once(0)
+                finally:
+                    safety.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await safety
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            # 401/403 是凭证问题（长轮询那边会报同一句话），只有「根本没这条路由」才算不支持
+            if status in (404, 405, 426, 501):
+                raise WsUnsupported(f"HTTP {status}") from exc
+            raise
+        finally:
+            self._ws_connected = False
+            self._ws_last_session_seconds = max(0.1, time.monotonic() - started)
+
+    @staticmethod
+    def _is_kick(raw: Any) -> bool:
+        """推送帧只认 `{"type":"kick"}`；其它帧一律忽略（不猜语义，将来加帧型时再改这里）。"""
+        try:
+            frame = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8", "ignore"))
+        except Exception:  # noqa: BLE001
+            return False
+        return isinstance(frame, dict) and frame.get("type") == "kick"
+
+    async def _safety_loop(self) -> None:
+        """兜底对账：挂着推送也定期单次拉一次（wait=0）。
+
+        三个作用：① kick 万一丢了（DO 重启、连接刚断、服务端 bug）消息不会卡在队列里；
+        ② 给服务端「Hermes 在线」打点（判在线的有效期 150s）；③ 顺手跑服务端的 stale 扫尾
+        （认领后没回写的消息会变成界面上一句看得见的失败）。
+        成本：每 60s 一次查询 —— 老的长轮询是每秒一次（30,556 次/天、≈466 万行读/天，实测）。
+        """
+        interval = self._ws_safety_poll_seconds
+        if interval <= 0:
+            logger.info("[%s] 兜底拉取已关闭（RUNONE_WS_SAFETY_POLL_SECONDS=0）—— 只靠 kick", self.name)
+            return
+        while not self._stopping:
+            await asyncio.sleep(interval)
+            await self._safe_poll_once(0)
+
+    async def _safe_poll_once(self, wait_seconds: float) -> int:
+        """拉一次；失败只记日志 —— 不能让一次网络抖动把推送会话打断（重连交给上层）。"""
+        try:
+            return await self._poll_once(wait_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] inbox fetch failed (%s: %s)", self.name, type(exc).__name__, exc)
+            return 0
+
+    def _ws_url(self) -> str:
+        """base_url → 推送面地址（http→ws / https→wss），路径与服务端路由一致。"""
+        base = self._base_url
+        if base.startswith("https://"):
+            base = "wss://" + base[len("https://"):]
+        elif base.startswith("http://"):
+            base = "ws://" + base[len("http://"):]
+        return f"{base}/ai/inbox/ws"
+
+    async def _poll_once(self, wait_seconds: float = POLL_WAIT_SECONDS) -> int:
+        """拉一次并投递。串行化：kick 触发的拉取与兜底拉取不许并发跑。
+
+        `wait_seconds=0` = 服务端做一次查询就返回（推送模式就是这个用法）；
+        `wait_seconds=25` = 老的长轮询（挂着等，到点空返回）。
+        """
+        async with self._poll_lock:
+            return await self._fetch_and_deliver(wait_seconds)
+
+    async def _fetch_and_deliver(self, wait_seconds: float) -> int:
         assert self._http is not None
         # 兜底：等不到文字的语音附件，超窗口后单独发一条（宁可两条，也不丢音频）
         await self._flush_stale_voice()
-        params: Dict[str, Any] = {"wait": POLL_WAIT_SECONDS, "limit": POLL_BATCH_LIMIT}
+        params: Dict[str, Any] = {"wait": wait_seconds, "limit": POLL_BATCH_LIMIT}
         if self._cursor:
             params["cursor"] = self._cursor
         res = await self._http.get("/ai/inbox", params=params)
@@ -515,7 +751,7 @@ async def _standalone_send(
             timeout=30.0,
             trust_env=_setting(extra, "use_system_proxy", "useSystemProxy", env="RUNONE_USE_SYSTEM_PROXY", default="0").lower()
             in {"1", "true", "yes", "on"},
-            headers={"Authorization": f"Bearer {token}", "User-Agent": "HermesAgent-RunoneAdapter/0.1"},
+            headers={"Authorization": f"Bearer {token}", "User-Agent": USER_AGENT},
         ) as client:
             res = await client.post(f"/ai/conversations/{chat_id}/messages", json=payload)
     except Exception as exc:  # noqa: BLE001

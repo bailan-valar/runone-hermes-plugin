@@ -1,14 +1,17 @@
 name: runone-platform
 label: RunOne
 kind: platform
-version: 0.3.0
+version: 0.4.0
 description: >
   RunOne plugin for Hermes Agent — two things behind one credential:
 
   INBOUND (platform adapter): RunOne's AI assistant page acts as a chat platform.
-  Hermes polls the RunOne API outbound (long-poll /ai/inbox) and writes replies
-  back (/ai/messages/:id/reply). No inbound exposure, no tunnel — RunOne's own
-  API stays the only surface.
+  Hermes connects outbound to RunOne's push face (WSS /ai/inbox/ws, backed by a
+  Durable Object) and is kicked the moment a message lands; the message itself is
+  then pulled from /ai/inbox and the reply written back to /ai/messages/:id/reply.
+  If the push face is unavailable (older server, websockets missing, RUNONE_WS=0)
+  it falls back to long-polling /ai/inbox automatically. No inbound exposure, no
+  tunnel — RunOne's own API stays the only surface.
 
   OUTBOUND (tools): the same RunOne operations as a native 'runone' toolset
   (list_today_tasks, create_task, update_goal, add_metric_record, ... 22 tools),
@@ -55,6 +58,12 @@ requires_env:
 optional_env:
   - name: RUNONE_HOME_CONVERSATION
     description: "Default conversation id for cron / notification delivery"
+    secret: false
+  - name: RUNONE_WS
+    description: "1 (default) = use the WSS push face for inbound; 0 = force long-polling"
+    secret: false
+  - name: RUNONE_WS_SAFETY_POLL_SECONDS
+    description: "While the push connection is up, still pull once every N seconds (default 60; 0 = kick only)"
     secret: false
   - name: RUNONE_ALLOWED_USERS
     description: "Comma-separated RunOne account ids allowed to talk to the agent"
