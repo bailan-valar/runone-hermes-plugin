@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -70,6 +71,12 @@ BACKOFF_MAX_SECONDS = 60.0
 POLL_BATCH_LIMIT = 20
 # typing 心跳间隔：比服务端 5s 有效期略短，掉了就自然过期（设计文档 §5-6）
 TYPING_HEARTBEAT_SECONDS = 4.0
+# 认领租约续期间隔（秒）：服务端租约 90s，回合可能跑几分钟，搭在 typing 心跳上续租。
+# 不续租的后果是实测过的：91s 的回合回写被服务端拒成 409，用户什么也看不到。
+LEASE_RENEW_SECONDS = 15.0
+# 语音附件的合并窗口（秒）：语音先到、文字随后；超过这个窗口还没等到文字回复，
+# 就把语音单独发一条（旧行为）——宁可分成两条，也不能把音频丢了。
+VOICE_MERGE_TIMEOUT_SECONDS = 60.0
 DEDUP_MAX_SIZE = 2000
 DEDUP_WINDOW_SECONDS = 600
 
@@ -106,6 +113,10 @@ class RunoneAdapter(BasePlatformAdapter):
         # chat_id(会话 id) → 该会话是否「AI 回复带语音」。开关注在服务端（会话列），
         # 随 inbox 投递下来；关掉时 send_voice 直接不发，连生成都省掉。
         self._voice_enabled: Dict[str, bool] = {}
+        # 入站消息 id → 上次续租的时刻（单调钟）：typing 心跳顺带续租，别每 2s 打一次
+        self._lease_touched: Dict[str, float] = {}
+        # chat_id(会话 id) → 已上传但还没挂上文字的语音附件（见 send_voice：正文与音频合并成一条消息）
+        self._pending_voice: Dict[str, Dict[str, Any]] = {}
 
     # ---- 连接生命周期 -------------------------------------------------------
 
@@ -158,6 +169,8 @@ class RunoneAdapter(BasePlatformAdapter):
         self._dedup = MessageDeduplicator(max_size=DEDUP_MAX_SIZE, ttl_seconds=DEDUP_WINDOW_SECONDS)
         self._reply_anchor.clear()
         self._voice_enabled.clear()
+        self._lease_touched.clear()
+        self._pending_voice.clear()
         logger.info("[%s] Disconnected", self.name)
 
     async def _teardown(self) -> None:
@@ -193,6 +206,8 @@ class RunoneAdapter(BasePlatformAdapter):
 
     async def _poll_once(self) -> int:
         assert self._http is not None
+        # 兜底：等不到文字的语音附件，超窗口后单独发一条（宁可两条，也不丢音频）
+        await self._flush_stale_voice()
         params: Dict[str, Any] = {"wait": POLL_WAIT_SECONDS, "limit": POLL_BATCH_LIMIT}
         if self._cursor:
             params["cursor"] = self._cursor
@@ -283,10 +298,26 @@ class RunoneAdapter(BasePlatformAdapter):
             # 没有入站锚点（例如 cron 主动投递）：直接往会话里写一条 assistant 消息
             path = f"/ai/conversations/{chat_id}/messages"
             payload["role"] = "assistant"
-        data = await self._request("POST", path, payload)
+        # 语音先到、正文随后：**合并成一条消息**（正文 + 音频附件）。
+        # 分成两条时，只要文字那条失败，界面上就只剩一个没有正文的语音条 —— 看着像「没回复」。
+        voice = self._pending_voice.pop(str(chat_id), None)
+        if voice and voice.get("attachmentId"):
+            payload["attachmentIds"] = [voice["attachmentId"]]
+
+        status, data = await self._request_status("POST", path, payload)
+        if status == 409 and anchor:
+            # 租约过期（回合比 90s 长）：服务端允许重新认领「租约已过期的 processing」消息，
+            # 认领到就立刻重试一次；幂等键没变，重试不会写第二条回复。
+            logger.info("[%s] reply rejected (409) — re-claiming %s and retrying once", self.name, anchor)
+            if await self._post(f"/ai/messages/{anchor}/claim", {}) is not None:
+                status, data = await self._request_status("POST", path, payload)
         if data is None:
+            if voice:  # 正文没写成功：把音频还给兜底逻辑，稍后单独发，别弄丢
+                voice["at"] = time.monotonic()
+                self._pending_voice[str(chat_id)] = voice
             return SendResult(success=False, error="RunOne 写入失败（详见网关日志）", retryable=True)
         self._reply_anchor.pop(str(chat_id), None)  # 一条入站消息一条回复
+        self._lease_touched.pop(anchor, None)
         return SendResult(success=True, message_id=str(data.get("id") or ""), raw_response=data)
 
     async def send_voice(
@@ -338,27 +369,70 @@ class RunoneAdapter(BasePlatformAdapter):
         except Exception as exc:  # noqa: BLE001
             logger.warning("[%s] voice: 上传 COS 失败：%s", self.name, exc)
             return SendResult(success=False, error="音频上传失败", retryable=True)
-        if attachment_id and await self._request("PATCH", f"/attachments/{attachment_id}/complete", {}) is None:
+        if not attachment_id or await self._request("PATCH", f"/attachments/{attachment_id}/complete", {}) is None:
             return SendResult(success=False, error="附件 complete 失败", retryable=True)
 
-        data = await self._request(
-            "POST",
-            f"/ai/conversations/{chat_id}/messages",
-            {
-                "role": "assistant",
-                "text": (caption or "").strip(),
-                "attachmentIds": [attachment_id] if attachment_id else [],
-                "clientMsgId": f"hermes-voice-{uuid.uuid4().hex}",
-            },
-        )
-        if data is None:
-            return SendResult(success=False, error="RunOne 写入语音消息失败", retryable=True)
-        logger.info("[%s] voice: 已投递音频附件 %s（%d 字节）", self.name, attachment_id, len(audio))
-        return SendResult(success=True, message_id=str(data.get("id") or ""), raw_response=data)
+        # 正文随后由 send() 一起写：**正文 + 音频附件 = 一条消息**。
+        # 为什么改：以前语音单独写一条消息，回写失败时就留下「只有语音、没有正文」的假回复
+        # （生产实测：用户以为 Hermes 没回）。合并后要么整条到，要么整条不到。
+        # 同一个会话里上一轮还没合并的语音先落地，避免被这一条顶掉。
+        await self._flush_stale_voice(str(chat_id), force=True)
+        self._pending_voice[str(chat_id)] = {
+            "attachmentId": attachment_id,
+            "caption": (caption or "").strip(),
+            "at": time.monotonic(),
+        }
+        logger.info("[%s] voice: 附件已上传 %s（%d 字节），等正文合并成一条消息", self.name, attachment_id, len(audio))
+        return SendResult(success=True, message_id="", raw_response={"attachmentId": attachment_id})
+
+    async def _flush_stale_voice(self, chat_id: Optional[str] = None, *, force: bool = False) -> None:
+        """兜底出口：等不到正文的语音附件，按旧行为单独写一条消息（宁可两条，也不能丢音频）。"""
+        if self._http is None or not self._pending_voice:
+            return
+        now = time.monotonic()
+        for cid, item in list(self._pending_voice.items()):
+            if chat_id is not None and cid != chat_id:
+                continue
+            if not force and now - float(item.get("at") or 0.0) < VOICE_MERGE_TIMEOUT_SECONDS:
+                continue
+            self._pending_voice.pop(cid, None)
+            data = await self._request(
+                "POST",
+                f"/ai/conversations/{cid}/messages",
+                {
+                    "role": "assistant",
+                    "text": str(item.get("caption") or ""),
+                    "attachmentIds": [item["attachmentId"]],
+                    "clientMsgId": f"hermes-voice-{uuid.uuid4().hex}",
+                },
+            )
+            if data is None:
+                logger.warning("[%s] voice: 单独投递语音附件 %s 失败（附件已上传，未挂到消息）", self.name, item.get("attachmentId"))
+            else:
+                logger.info("[%s] voice: 没等到正文，已单独投递语音附件 %s", self.name, item.get("attachmentId"))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """typing 是心跳式的：服务端 5s 过期，网关的 _keep_typing 每 2s 会调到这里。"""
-        await self._post(f"/ai/conversations/{chat_id}/typing", {}) if self._http else None
+        """typing 是心跳式的：服务端 5s 过期，网关的 _keep_typing 每 2s 会调到这里。
+
+        顺带**续租**：认领租约固定 90s，而一次回合可能跑好几分钟；不续租的结果就是
+        「回复生成完了、回写却被判租约过期」→ 409 → 用户什么也看不到（生产实测 91s 被拒）。
+        搭在 typing 上是因为它本来每 2s 一次、且只在处理期间发；这里按 LEASE_RENEW_SECONDS 节流。
+        """
+        if self._http is None:
+            return
+        await self._post(f"/ai/conversations/{chat_id}/typing", {})
+        anchor = self._reply_anchor.get(str(chat_id))
+        if not anchor:
+            return
+        now = time.monotonic()
+        if now - self._lease_touched.get(anchor, 0.0) < LEASE_RENEW_SECONDS:
+            return
+        self._lease_touched[anchor] = now
+        status, body = await self._request_status("POST", f"/ai/messages/{anchor}/heartbeat", {}, quiet=True)
+        if status == 404:
+            logger.debug("[%s] heartbeat endpoint not in this server build (404) — lease relies on claim only", self.name)
+        elif status == 200 and isinstance(body, dict) and body.get("ok") is False:
+            logger.debug("[%s] heartbeat: %s is already %s", self.name, anchor, body.get("status"))
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         data = await self._request("GET", f"/ai/conversations/{chat_id}")
@@ -373,21 +447,35 @@ class RunoneAdapter(BasePlatformAdapter):
 
     # ---- HTTP 小工具 -------------------------------------------------------
 
-    async def _request(self, method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    async def _request(
+        self, method: str, path: str, payload: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
+        return (await self._request_status(method, path, payload))[1]
+
+    async def _request_status(
+        self, method: str, path: str, payload: Optional[Dict[str, Any]] = None, *, quiet: bool = False
+    ) -> tuple:
+        """底层请求：返回 `(status_code, body)`。
+
+        为什么要把状态码留给调用方：`/reply` 的 409 是**有意义的信号**（租约过期，可重新认领后重试），
+        而旧的写法把状态码吞掉了，只回一个 None，调用方只能当成「写入失败」放弃。
+        `quiet=True` 用于探测式调用（例如给旧服务端打 heartbeat 会 404），不刷警告日志。
+        """
         if self._http is None:
-            return None
+            return 0, None
         try:
             res = await self._http.request(method, path, json=payload)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[%s] %s %s failed: %s", self.name, method, path, exc)
-            return None
+            return 0, None
         if res.status_code >= 400:
-            logger.warning("[%s] %s %s → HTTP %s: %s", self.name, method, path, res.status_code, res.text[:200])
-            return None
+            if not quiet or res.status_code >= 500:
+                logger.warning("[%s] %s %s → HTTP %s: %s", self.name, method, path, res.status_code, res.text[:200])
+            return res.status_code, None
         try:
-            return res.json()
+            return res.status_code, res.json()
         except Exception:  # noqa: BLE001 — 204 之类没有 body 也算成功
-            return {}
+            return res.status_code, {}
 
     async def _post(self, path: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return await self._request("POST", path, payload)

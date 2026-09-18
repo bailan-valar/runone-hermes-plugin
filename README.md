@@ -9,8 +9,9 @@
 RunOne 前端 /ai ──► RunOne Worker + D1（消息、任务与权限的唯一真相）
                             ▲
                             │ GET  /ai/inbox?cursor&wait=25   （长轮询，出站）
-                            │ POST /ai/messages/:id/claim     （认领 + 租约）
-                            │ POST /ai/messages/:id/reply     （回写，幂等）
+                            │ POST /ai/messages/:id/claim     （认领 + 90s 租约）
+                            │ POST /ai/messages/:id/heartbeat （租约续期，搭在 typing 心跳上）
+                            │ POST /ai/messages/:id/reply     （回写，幂等；语音附件与正文同一条）
                             │ POST /ai/conversations/:id/typing
                             │
                  ┌──────────┴───────────┐
@@ -81,9 +82,28 @@ hermes -p worker plugins install bailan-valar/runone-hermes-plugin --enable
 | `connect()` | 建 httpx 客户端（Bearer PAT）→ 起 `_poll_loop` → `_mark_connected()` |
 | `_poll_loop()` / `_poll_once()` | 长轮询 `/ai/inbox`；指数退避 + 抖动重连；**游标只在整批投递成功后推进**（不丢消息） |
 | `_deliver(item)` | 去重 → `claim` → `build_source()` 造 `MessageEvent` → `handle_message()`（先认领后干活） |
-| `send(chat_id, text)` | 有入站锚点走 `/ai/messages/:id/reply`（带 `clientMsgId` 幂等键），无锚点（cron）直接写 assistant 消息 |
-| `send_typing(chat_id)` | `/ai/conversations/:id/typing` 心跳（服务端 5s 过期） |
+| `send(chat_id, text)` | 有入站锚点走 `/ai/messages/:id/reply`（带 `clientMsgId` 幂等键），无锚点（cron）直接写 assistant 消息；**被拒 409（租约过期）时先重新 `claim` 再用同一个幂等键重放一次** |
+| `send_voice(chat_id, audio)` | 上传音频 → **不单独发消息**，把附件 ID 挂给紧随其后的 `send()`（正文与语音同一条）；等不到正文（60s）由 `_flush_stale_voice` 兜底单独投递 |
+| `send_typing(chat_id)` | `/ai/conversations/:id/typing` 心跳（服务端 5s 过期），**顺带续租** `/ai/messages/:id/heartbeat`（15s 节流） |
 | `_standalone_send(...)` | cron 独立进程投递（`deliver=runone:<会话 id>`） |
+
+## 行为口径（2026-09-17，生产事故后补的）
+
+生产事故：一轮 91 秒的回合（7 次工具调用）回写时撞上 90s 租约到期，服务端 4 次回 `409`，
+**回复丢失**，RunOne 界面只剩一条没有正文的语音条。三条口径从此固定下来：
+
+1. **ack 不早于回写成功**：只有 `/reply` 成功才把这条入站当成已处理。
+2. **只重试投递，不重跑工作**：409 → 重新 `claim`（服务端允许重新认领「租约已过期的 processing」）→ 用**同一个 `clientMsgId`** 重放 `/reply`。
+   为什么不像 Telegram 那样「投不出去就留着重投」：那边重投的是**还没跑的工作**；这里消息被认领时 agent 已经把活干完了，重投等于把工具副作用（建任务、写文件）跑第二遍。
+3. **长回合靠自己续租**：`send_typing` 顺带 `/ai/messages/:id/heartbeat`（15s 节流）。租约固定 90s 是「证明还活着」的阈值，不是「回合能跑多久」的上限。
+   **本插件要求服务端有 `/heartbeat` 端点**（服务端 2026-09-17 起有；旧服务端会 404，此时只影响超长回合的续租，其它行为不变）。
+   服务端还有一条兜底：`processing` 且租约过期超过 10 分钟仍没回写 → 消息置 `failed` + 一条 system 说明，用户在界面上能看到「没回复成功」并手动重发。
+
+**验证（2026-09-17，本机 8789 真服务端 + 真账号 PAT + 真 COS 上传，用本仓库的 `adapter.py` 直跑）**：
+`%TEMP%\ai_adapter_check.py` → **15/15 全绿**：409 → 重新认领 → 只写出一条正确回复；
+typing 之后租约被续到未来、15s 内重复 typing 不再续租（节流生效）；
+语音与正文合并成**一条**消息（正文 + 1 个附件）；等不到正文时兜底单独投递纯语音消息。
+（服务端侧另有 `%TEMP%\ai_lease_check.py` 15/15。）
 
 ## 已验证（2026-09-16，本机 8787 + 真实账号 PAT）
 
