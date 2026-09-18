@@ -11,6 +11,10 @@
   # 生产（会建一条测试会话再删掉）
   python scripts/verify_ws_wakeup.py --base-url https://runone-api.capdien.site --token rn_xxx
 
+⚠️ 打生产时：这条测试会话会被**真的适配器认领**（它就是一条普通会话）——脚本删得快、适配器答得慢，
+   于是日志里会出现十几行 `POST … /messages → HTTP 404 会话不存在`（实测 22 秒后自停）。
+   要么先停网关再跑，要么接受这段噪声。
+
 断言：
   1. 不带 Upgrade 头打 /ai/inbox/ws → 426（证明这条路由在这版服务端上存在）
   2. 带 PAT 升级 → 连上；GET /ai/inbox/hub 的连接数从 0 变 1
