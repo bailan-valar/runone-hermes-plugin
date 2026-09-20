@@ -90,9 +90,38 @@ hermes -p worker plugins install bailan-valar/runone-hermes-plugin --enable
 | `_poll_once(wait)` / `_fetch_and_deliver()` | `/ai/inbox`；指数退避 + 抖动重连；**游标只在整批投递成功后推进**（不丢消息）；两条拉取路径用锁串行化 |
 | `_deliver(item)` | 去重 → `claim` → `build_source()` 造 `MessageEvent` → `handle_message()`（先认领后干活） |
 | `send(chat_id, text)` | 有入站锚点走 `/ai/messages/:id/reply`（带 `clientMsgId` 幂等键），无锚点（cron）直接写 assistant 消息；**被拒 409（租约过期）时先重新 `claim` 再用同一个幂等键重放一次** |
-| `send_voice(chat_id, audio)` | 上传音频 → **不单独发消息**，把附件 ID 挂给紧随其后的 `send()`（正文与语音同一条）；等不到正文（60s）由 `_flush_stale_voice` 兜底单独投递 |
+| `send_voice(chat_id, audio)` | 上传音频 → **不单独发消息**，把附件 ID 挂给紧随其后的 `send()`/定稿编辑（正文与语音同一条）；等不到正文（60s）由 `_flush_stale_voice` 兜底单独投递 |
 | `send_typing(chat_id)` | `/ai/conversations/:id/typing` 心跳（服务端 5s 过期），**顺带续租** `/ai/messages/:id/heartbeat`（15s 节流） |
+| `edit_message(chat_id, id, text, finalize=…)` | 流式：`PATCH /ai/messages/:id` 改那条草稿行的正文；`finalize=True` 定稿（服务端同请求里把入站消息置 `replied`）并把这一轮的语音附件并上 |
 | `_standalone_send(...)` | cron 独立进程投递（`deliver=runone:<会话 id>`） |
+
+## 逐字流式（2026-09-20，批二后半）
+
+界面里「AI 的回复同一条气泡原地长出来」＝ 应用侧的草稿行 + 本适配器的 `edit_message`。链路：
+
+```
+回合开始 → send(text, metadata={expect_edits:True})   → POST /ai/messages/:id/reply {streaming:true}  → 建草稿行(status=streaming)
+每 0.8s → edit_message(..., finalize=False)          → PATCH /ai/messages/:id {text, finalize:false}   → 同一行改正文（seq 不变）
+回合结束 → edit_message(..., finalize=True)           → PATCH /ai/messages/:id {text, finalize:true, attachmentIds?}
+                                                         → 草稿行转 replied + 入站消息 replied + 音频并进同一条
+```
+
+要点（都在 `adapter.py` 的注释里）：
+
+1. **草稿行不进增量的 `data`**，只从响应里的 `draft` 出来（服务端口径）——前端据此把它画成最后一条带光标的助手气泡。
+2. **`REQUIRES_EDIT_FINALIZE = True`**：定稿那一次编辑不能因为「正文与上一片一样」被跳过。它同时是
+   释放入站租约、把草稿行转 `replied` 的唯一动作；跳过就留下一条永远在长的脏草稿。
+3. **两种兜底**：草稿建不出来（旧服务端）→ 退回整段发送；定稿编辑失败 → 网关退回整段发送，而
+   那条路凭可推导的幂等键 `reply:<入站消息 id>` 命中**同一行**定稿，不会多冒一条。
+4. **带语音的轮次**在定稿那一次并附件（`attachmentIds`），保持「正文 + 音频 = 一条消息」。
+5. 适配器被杀 / 网关重启留下的草稿，由服务端 `sweepStaleDrafts`（超 10 分钟）转成普通助手消息。
+
+**开关（Hermes 侧）**：`display.platforms.runone.streaming: true`（只给这个平台开；本机顶层
+`streaming.enabled` 是 false，那是给别的平台留的）。改完要 **重启网关**才生效（插件只在启动时加载）。
+
+**验收**：`scripts/acceptance_streaming.py`（真 adapter 代码 + 真 API），本机 dev server 上
+**通过 24 项 / 失败 0 项**（2026-09-20）。跑法见脚本头部注释；服务端口径与取证记录在
+monorepo 的 `docs/ai-channel-design.md` §20。
 
 ## 行为口径（2026-09-17，生产事故后补的）
 

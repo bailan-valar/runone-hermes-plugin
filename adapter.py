@@ -150,6 +150,13 @@ def _float_setting(extra: Dict[str, Any], *keys: str, env: str = "", default: fl
 
 
 class RunoneAdapter(BasePlatformAdapter):
+    # 逐字流式（批二）：编辑已发出的消息 = `PATCH /ai/messages/:id`（服务端同 seq 改正文）。
+    # 网关据此在「发分片 → 改同一条 → 定稿」这条路上跑；关掉时行为与旧版完全一致。
+    SUPPORTS_MESSAGE_EDITING = True
+    # 定稿那一次编辑不能因为「正文与上一片一样」被跳过：它同时是释放入站消息租约、
+    # 把草稿行从 `streaming` 转成 `replied` 的唯一动作。跳过就会留下永远在长的脏草稿。
+    REQUIRES_EDIT_FINALIZE = True
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config=config, platform=Platform(PLATFORM_NAME))
         extra = config.extra or {}
@@ -191,6 +198,9 @@ class RunoneAdapter(BasePlatformAdapter):
         self._lease_touched: Dict[str, float] = {}
         # chat_id(会话 id) → 已上传但还没挂上文字的语音附件（见 send_voice：正文与音频合并成一条消息）
         self._pending_voice: Dict[str, Dict[str, Any]] = {}
+        # chat_id(会话 id) → 本轮流式草稿的助手行 id（服务端 status='streaming' 那条）。
+        # 有它就意味着「这一轮的回复已经长在界面上了」，后面的写入走编辑/定稿而不是新开一条。
+        self._draft_rows: Dict[str, str] = {}
 
     # ---- 连接生命周期 -------------------------------------------------------
 
@@ -254,6 +264,7 @@ class RunoneAdapter(BasePlatformAdapter):
         self._voice_enabled.clear()
         self._lease_touched.clear()
         self._pending_voice.clear()
+        self._draft_rows.clear()
         logger.info("[%s] Disconnected", self.name)
 
     async def _teardown(self) -> None:
@@ -518,28 +529,19 @@ class RunoneAdapter(BasePlatformAdapter):
 
     # ---- 出站：回复 / typing / 会话信息 ------------------------------------
 
-    async def send(
-        self,
-        chat_id: str,
-        content: str,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> SendResult:
-        anchor = self._reply_anchor.get(str(chat_id))
-        # clientMsgId 幂等键：网络抖动重试时服务端复用同一条助手消息（设计文档 §5-3）
-        payload: Dict[str, Any] = {"text": content, "clientMsgId": f"hermes-{uuid.uuid4().hex}"}
+    async def _write_reply(
+        self, anchor: Optional[str], chat_id: str, payload: Dict[str, Any]
+    ) -> tuple:
+        """写一次 `/reply`（没有锚点时写 `/conversations/:id/messages`），409 时重新认领再试一次。
+
+        单独抽出来是因为流式那条路要打同一条口子三次（首片草稿 / 后续分片走 PATCH / 定稿兜底），
+        三处的「幂等 + 409 重认领」口径必须一份实现。
+        """
         if anchor:
             path = f"/ai/messages/{anchor}/reply"
         else:
-            # 没有入站锚点（例如 cron 主动投递）：直接往会话里写一条 assistant 消息
             path = f"/ai/conversations/{chat_id}/messages"
-            payload["role"] = "assistant"
-        # 语音先到、正文随后：**合并成一条消息**（正文 + 音频附件）。
-        # 分成两条时，只要文字那条失败，界面上就只剩一个没有正文的语音条 —— 看着像「没回复」。
-        voice = self._pending_voice.pop(str(chat_id), None)
-        if voice and voice.get("attachmentId"):
-            payload["attachmentIds"] = [voice["attachmentId"]]
-
+            payload.setdefault("role", "assistant")
         status, data = await self._request_status("POST", path, payload)
         if status == 409 and anchor:
             # 租约过期（回合比 90s 长）：服务端允许重新认领「租约已过期的 processing」消息，
@@ -547,14 +549,95 @@ class RunoneAdapter(BasePlatformAdapter):
             logger.info("[%s] reply rejected (409) — re-claiming %s and retrying once", self.name, anchor)
             if await self._post(f"/ai/messages/{anchor}/claim", {}) is not None:
                 status, data = await self._request_status("POST", path, payload)
+        return status, data
+
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        chat_key = str(chat_id)
+        anchor = self._reply_anchor.get(chat_key)
+
+        # ① 流式首片：网关带着 `expect_edits` 发来的分片 → 先建一条 `status='streaming'` 的草稿行，
+        #    之后每片由 edit_message 改这一行（服务端的 draft 字段单给前端，增量里看不到它）。
+        #    建不出来（旧服务端 / 被拒）就照旧整段发 —— 宁可不要逐字，也不能把这条回复弄丢。
+        #    带语音的轮次不走这条路：语音要跟正文合成一条，合并发生在最后的 send()/finalize 上。
+        if anchor and not self._pending_voice.get(chat_key) and bool((metadata or {}).get("expect_edits")):
+            status, draft = await self._write_reply(anchor, chat_key, {"text": content, "streaming": True})
+            draft_id = str((draft or {}).get("id") or "")
+            if draft_id:
+                self._draft_rows[chat_key] = draft_id
+                logger.info("[%s] 流式草稿已开（%s，seq %s）", self.name, draft_id, (draft or {}).get("seq"))
+                return SendResult(success=True, message_id=draft_id, raw_response=draft)
+            logger.warning("[%s] 草稿创建失败（status=%s）——本轮退回整段发送", self.name, status)
+
+        # clientMsgId 幂等键：网络抖动重试时服务端复用同一条助手消息（设计文档 §5-3）。
+        # 已经开过草稿的轮次**不带**这个键，让服务端用可推导的 `reply:<入站消息 id>` ——
+        # 这样这一笔会命中那条草稿行并把它定稿，而不是在旁边再冒出一条新消息。
+        payload: Dict[str, Any] = {"text": content}
+        if not self._draft_rows.get(chat_key):
+            payload["clientMsgId"] = f"hermes-{uuid.uuid4().hex}"
+
+        # 语音先到、正文随后：**合并成一条消息**（正文 + 音频附件）。
+        # 分成两条时，只要文字那条失败，界面上就只剩一个没有正文的语音条 —— 看着像「没回复」。
+        voice = self._pending_voice.pop(chat_key, None)
+        if voice and voice.get("attachmentId"):
+            payload["attachmentIds"] = [voice["attachmentId"]]
+
+        status, data = await self._write_reply(anchor, chat_key, payload)
         if data is None:
             if voice:  # 正文没写成功：把音频还给兜底逻辑，稍后单独发，别弄丢
                 voice["at"] = time.monotonic()
-                self._pending_voice[str(chat_id)] = voice
+                self._pending_voice[chat_key] = voice
             return SendResult(success=False, error="RunOne 写入失败（详见网关日志）", retryable=True)
-        self._reply_anchor.pop(str(chat_id), None)  # 一条入站消息一条回复
+        self._draft_rows.pop(chat_key, None)
+        self._reply_anchor.pop(chat_key, None)  # 一条入站消息一条回复
         self._lease_touched.pop(anchor, None)
         return SendResult(success=True, message_id=str(data.get("id") or ""), raw_response=data)
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """流式分片/定稿：`PATCH /ai/messages/:id` 改那条草稿行的正文。
+
+        `finalize=True` 是这一轮的最后一次写入 —— 服务端在同一个请求里把草稿行转成 `replied`、
+        并把入站消息置 replied（释放租约），所以这一步不做就等于「回复写完了但没人知道」。
+        语音附件在这一步并上（正文 + 音频 = 一条消息），与 send() 的口径一致。
+        """
+        if self._http is None:
+            return SendResult(success=False, error="adapter 未连接")
+        chat_key = str(chat_id)
+        payload: Dict[str, Any] = {"text": content, "finalize": bool(finalize)}
+        voice = self._pending_voice.pop(chat_key, None) if finalize else None
+        if voice and voice.get("attachmentId"):
+            payload["attachmentIds"] = [voice["attachmentId"]]
+
+        status, data = await self._request_status("PATCH", f"/ai/messages/{message_id}", payload)
+        if data is None:
+            if voice:
+                voice["at"] = time.monotonic()
+                self._pending_voice[chat_key] = voice
+            # 定稿失败时**不动** _draft_rows / 锚点：网关会退回「整段发送」，而那条路凭
+            # `reply:<入站消息 id>` 命中同一行把它定稿，不会留下永远在长的脏草稿。
+            logger.warning(
+                "[%s] edit_message 失败（status=%s，finalize=%s）——交给整段发送兜底",
+                self.name, status, finalize,
+            )
+            return SendResult(success=False, error="RunOne 编辑失败（详见网关日志）", retryable=True)
+        if finalize:
+            self._draft_rows.pop(chat_key, None)
+            anchor = self._reply_anchor.pop(chat_key, None)
+            self._lease_touched.pop(anchor, None)
+        return SendResult(success=True, message_id=str(data.get("id") or message_id), raw_response=data)
 
     async def send_voice(
         self,
