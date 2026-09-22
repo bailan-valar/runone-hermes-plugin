@@ -9,8 +9,14 @@
   4. 定稿（`finalize=True`）→ 草稿行转 `replied`、入站消息转 `replied`、语音附件并进**同一条**；
   5. 定稿之后 `draft` 归 null，定稿行出现在 `data` 里（增量能看到定稿）；
   6. 整轮只落 2 行（1 user + 1 assistant）——没有「草稿 + 定稿」两份正文；
-  7. 兜底：草稿行迟迟等不到定稿时，被 `sweepStaleDrafts` 转成 `replied`（不再永远「正在长」）；
-  8. 清理：删掉测试会话后列表里没有它。
+  7. 兜底：草稿行迟迟等不到定稿时，被 `sweepStaleDrafts` 转成 `replied`（正文照原样留着），
+     尾部光标被擦掉，并且它挂着的**入站消息也被放掉**（不再等 `sweepStaleProcessing` 判 failed）；
+  8. 清理：删掉测试会话后列表里没有它；
+  9. **编辑是严格的**：对已定稿行改不同正文 → 失败（网关会走整段兜底，不再被「假成功」吞掉回复）；
+     同正文重放 → 仍然成功（幂等）；
+ 10. **入站被前置写入置成 replied 时也能开出草稿**：中间态写入（工具进度 / 提示）不消耗锚点、
+     不把入站置 replied；`/reply` 被 409 挡住时走会话消息端点那条路开草稿，逐字流式照旧生效，
+     定稿后入站租约照旧放掉。
 
 跑法（**先起本机 dev server，端口别占并行会话的 8787/5173/8642**）：
 
@@ -181,6 +187,12 @@ async def main() -> int:
     conv_id = ""
     draft_id = ""
 
+    def use_inbound(message_id: str) -> None:
+        """照 `_deliver()` 的顺序记两条：`_reply_anchor`（这一笔回写到哪条入站消息）
+        + `_turn_inbound`（这一轮在回谁 —— 锚点被前置写入用掉之后，草稿行还要靠它挂回去）。"""
+        adapter._reply_anchor[conv_id] = message_id
+        adapter._turn_inbound[conv_id] = message_id
+
     async def messages(after_seq: int = 0) -> dict:
         res = await user_client.get(f"/ai/conversations/{conv_id}/messages", params={"afterSeq": after_seq})
         res.raise_for_status()
@@ -203,7 +215,7 @@ async def main() -> int:
         # 适配器那一侧：认领 → 记锚点（与 _deliver 里同序）
         claimed = await adapter._post(f"/ai/messages/{inbound_id}/claim", {})
         check("适配器认领成功", claimed is not None, f"resp={str(claimed)[:80]}")
-        adapter._reply_anchor[conv_id] = inbound_id
+        use_inbound(inbound_id)
 
         print("\n[1] 流式首片 → 建草稿行")
         first = await adapter.send(conv_id, "第一片文字", metadata={"expect_edits": True})
@@ -246,14 +258,73 @@ async def main() -> int:
         check("[6] 整轮只落 2 行（没有草稿副本）", len(page.get("data", [])) == 2,
               f"rows={[(m.get('role'), m.get('seq')) for m in page.get('data', [])]}")
 
-        print("\n[7] 兜底：没人定稿的草稿被扫尾转成 replied")
+        print("\n[9] 编辑严格的：定稿行再改 → 409；同正文重放 → 200（幂等）")
+        # 线上事故形态：这一片编辑打在一条**非 streaming** 的行上。旧服务端回 200「成功但什么都不改」，
+        # 网关便以为正文已经送达、把这一轮的完整回复抑制掉（只剩半截 + 光标）。
+        flip = await adapter.edit_message(conv_id, draft_id, "想改成别的内容", finalize=False)
+        check("[9] 对已定稿行改不同正文 → 失败（网关会走整段兜底，不再吞回复）", flip.success is False,
+              f"success={flip.success}")
+        same = await adapter.edit_message(conv_id, draft_id, "最终正文（定稿）", finalize=False)
+        check("[9] 同正文重放 → 仍然成功（幂等，适配器重试不会报错）", bool(same.success), f"success={same.success}")
+
+        print("\n[10] 中间态写入不吃锚点；入站已被前置写入置 replied 时也能开出草稿")
+        res = await user_client.post(f"/ai/conversations/{conv_id}/messages",
+                                     json={"role": "user", "text": "流式验收：先有工具进度，再流式"})
+        inbound3 = (res.json() or {}).get("id", "")
+        await adapter._post(f"/ai/messages/{inbound3}/claim", {})
+        use_inbound(inbound3)
+        notice = await adapter.send(conv_id, "📚 工具进度（中间态）", metadata={"_interim_send": True})
+        check("[10] 中间态发送成功", bool(notice.success), f"success={notice.success} err={notice.error}")
+        page = await messages()
+        row = next((m for m in page.get("data", []) if m.get("id") == notice.message_id), None)
+        check("[10] 中间态是**普通助手消息**（不是草稿）", bool(row) and row.get("status") == "replied",
+              f"row={row.get('status') if row else None}")
+        inb = next((m for m in page.get("data", []) if m.get("id") == inbound3), None)
+        check("[10] 入站消息**没有被置 replied**（中间态不是答案）",
+              bool(inb) and inb.get("status") == "processing", f"status={inb.get('status') if inb else None}")
+        first3 = await adapter.send(conv_id, "首片（有锚点，走 /reply）", metadata={"expect_edits": True})
+        check("[10] 紧接着的流式首片仍然开出了草稿行", bool(first3.message_id),
+              f"id={first3.message_id} err={first3.error}")
+        page = await messages()
+        check("[10] 草稿行状态是 streaming（可继续编辑）",
+              (page.get("draft") or {}).get("id") == first3.message_id,
+              f"draft={(page.get('draft') or {}).get('id')}")
+        # 把入站置成 replied（= 这一轮里先落了别的助手写入），再开一条草稿：/reply 会被 409 挡住
+        await adapter.send(conv_id, "整段回复（会把入站置成 replied）")
+        res = await user_client.post(f"/ai/conversations/{conv_id}/messages",
+                                     json={"role": "user", "text": "流式验收：入站已被前置写入置 replied"})
+        inbound4 = (res.json() or {}).get("id", "")
+        await adapter._post(f"/ai/messages/{inbound4}/claim", {})
+        use_inbound(inbound4)
+        await adapter.send(conv_id, "前置写入（把入站置 replied）")
+        page = await messages()
+        inb4 = next((m for m in page.get("data", []) if m.get("id") == inbound4), None)
+        check("[10] 前置写入确实把入站置成了 replied",
+              bool(inb4) and inb4.get("status") == "replied", f"status={inb4.get('status') if inb4 else None}")
+        fallback = await adapter.send(conv_id, "首片（锚点已不可写，走会话消息端点）",
+                                      metadata={"expect_edits": True})
+        check("[10] /reply 开不出来时，兜底路仍然开出草稿行", bool(fallback.message_id),
+              f"id={fallback.message_id} err={fallback.error}")
+        page = await messages()
+        draft2 = page.get("draft") or {}
+        check("[10] 兜底开出的也是 streaming 草稿（逐字流式照旧生效）",
+              draft2.get("id") == fallback.message_id and draft2.get("status") == "streaming",
+              f"draft={draft2.get('id')} status={draft2.get('status')}")
+        fin2 = await adapter.edit_message(conv_id, str(fallback.message_id), "兜底草稿定稿", finalize=True)
+        check("[10] 兜底草稿能正常定稿", bool(fin2.success), f"success={fin2.success} err={fin2.error}")
+        page = await messages()
+        inb4 = next((m for m in page.get("data", []) if m.get("id") == inbound4), None)
+        check("[10] 定稿放掉了入站租约", bool(inb4) and inb4.get("status") == "replied",
+              f"status={inb4.get('status') if inb4 else None}")
+
+        print("\n[7] 兜底：没人定稿的草稿被扫尾转成 replied（擦掉尾部光标 + 放掉入站）")
         # 另起一条：开草稿行，但把它的 updated_at 改老（模拟适配器进程被杀），再打一次增量接口
         res = await user_client.post(f"/ai/conversations/{conv_id}/messages",
                                      json={"role": "user", "text": "流式验收：这条不会有人定稿"})
         inbound2 = (res.json() or {}).get("id", "")
         await adapter._post(f"/ai/messages/{inbound2}/claim", {})
-        adapter._reply_anchor[conv_id] = inbound2
-        stale = await adapter.send(conv_id, "半截草稿（没有定稿）", metadata={"expect_edits": True})
+        use_inbound(inbound2)
+        stale = await adapter.send(conv_id, "半截草稿（没有定稿） ▉", metadata={"expect_edits": True})
         stale_id = str(stale.message_id or "")
         check("[7] 第二条草稿已开出", bool(stale_id), f"id={stale_id}")
         age = await _age_out_draft(repo, stale_id)
@@ -262,6 +333,11 @@ async def main() -> int:
         row = next((m for m in page.get("data", []) if m.get("id") == stale_id), None)
         check("[7] 扫尾后它变成一条普通助手消息", bool(row) and row.get("status") == "replied",
               f"row={row.get('status') if row else None}")
+        check("[7] 尾部光标被擦掉（不再留着 `… ▉`）",
+              bool(row) and row.get("text") == "半截草稿（没有定稿）", f"text={row.get('text') if row else None!r}")
+        inb2 = next((m for m in page.get("data", []) if m.get("id") == inbound2), None)
+        check("[7] 入站消息被放掉（不再挂着等 sweepStaleProcessing 判 failed）",
+              bool(inb2) and inb2.get("status") == "replied", f"status={inb2.get('status') if inb2 else None}")
         check("[7] 之后 draft 归 null", page.get("draft") is None, f"draft={page.get('draft')}")
     finally:
         print("\n[8] 清理")

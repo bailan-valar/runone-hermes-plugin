@@ -101,6 +101,7 @@ hermes -p worker plugins install bailan-valar/runone-hermes-plugin --enable
 
 ```
 回合开始 → send(text, metadata={expect_edits:True})   → POST /ai/messages/:id/reply {streaming:true}  → 建草稿行(status=streaming)
+           （①被 409 挡住时 → POST /ai/conversations/:id/messages {streaming:true, replyToMessageId} → 同样建草稿行）
 每 0.8s → edit_message(..., finalize=False)          → PATCH /ai/messages/:id {text, finalize:false}   → 同一行改正文（seq 不变）
 回合结束 → edit_message(..., finalize=True)           → PATCH /ai/messages/:id {text, finalize:true, attachmentIds?}
                                                          → 草稿行转 replied + 入站消息 replied + 音频并进同一条
@@ -111,17 +112,34 @@ hermes -p worker plugins install bailan-valar/runone-hermes-plugin --enable
 1. **草稿行不进增量的 `data`**，只从响应里的 `draft` 出来（服务端口径）——前端据此把它画成最后一条带光标的助手气泡。
 2. **`REQUIRES_EDIT_FINALIZE = True`**：定稿那一次编辑不能因为「正文与上一片一样」被跳过。它同时是
    释放入站租约、把草稿行转 `replied` 的唯一动作；跳过就留下一条永远在长的脏草稿。
-3. **两种兜底**：草稿建不出来（旧服务端）→ 退回整段发送；定稿编辑失败 → 网关退回整段发送，而
-   那条路凭可推导的幂等键 `reply:<入站消息 id>` 命中**同一行**定稿，不会多冒一条。
-4. **带语音的轮次**在定稿那一次并附件（`attachmentIds`），保持「正文 + 音频 = 一条消息」。
-5. 适配器被杀 / 网关重启留下的草稿，由服务端 `sweepStaleDrafts`（超 10 分钟）转成普通助手消息。
+3. **草稿两条开法**（2026-09-22 补）：
+   - ① `POST /ai/messages/:id/reply {streaming:true}` —— 入站消息还可回写时的正路；
+   - ② `POST /ai/conversations/:id/messages {role:assistant, streaming:true, replyToMessageId}` ——
+     **入站消息已经被本轮某一笔前置写入置成 `replied`** 时（工具进度气泡、提示文本），① 会被 409
+     挡住。这条路不依赖入站可写性，只要 `_turn_inbound` 还记着本轮在回谁。
+   两条都不通（旧服务端）才退回整段发送。**没有 ② 时的线上事故**：每一片编辑都打在一条非
+   `streaming` 的行上，旧服务端回 200「成功但什么都不改」，网关便以为正文已送达、把整轮的
+   完整回复抑制掉 —— 界面只剩十几个字 + 光标（`今天 2026-09-22（ ▉`）。
+4. **中间态写入不吃锚点**：带 `metadata._interim_send` 的发送（工具进度、审批/提示、分段尾巴）
+   走会话消息端点，既不消耗 `_reply_anchor`，也不把入站消息置成 `replied`（置早了第 3 条的 ① 就废了）。
+5. **编辑失败就是失败**：`PATCH` 收到 409（草稿行已被定稿/扫尾）时丢掉草稿登记并如实返回失败，
+   网关会走「整段发送」把没显示出来的部分补上。服务端那边也同步收紧：对非 `streaming` 行改
+   **不同正文**回 409（同正文重放仍然 200 幂等）—— 旧写法回 200 静默丢内容，是上面那起事故的直接原因。
+6. **带语音的轮次**在定稿那一次并附件（`attachmentIds`），保持「正文 + 音频 = 一条消息」。
+7. 适配器被杀 / 网关重启留下的草稿，由服务端 `sweepStaleDrafts`（超 10 分钟）转成普通助手消息，
+   同时擦掉尾部光标、放掉它挂着的入站消息。
 
 **开关（Hermes 侧）**：`display.platforms.runone.streaming: true`（只给这个平台开；本机顶层
-`streaming.enabled` 是 false，那是给别的平台留的）。改完要 **重启网关**才生效（插件只在启动时加载）。
+`streaming.enabled` 是 false，那是给别的平台留的）。**另建议** `display.platforms.runone.tool_progress: false`
+（2026-09-22 起本机如此）：工具进度气泡是「每条工具调用一个气泡」的噪声，而且在服务端还不认识
+第 3 条②之前，它会先把入站消息置成 `replied`、把逐字流式堵死。改完要 **重启网关**才生效（插件只在启动时加载）。
 
-**验收**：`scripts/acceptance_streaming.py`（真 adapter 代码 + 真 API），本机 dev server 上
-**通过 24 项 / 失败 0 项**（2026-09-20）。跑法见脚本头部注释；服务端口径与取证记录在
-monorepo 的 `docs/ai-channel-design.md` §20。
+**验收**：`scripts/acceptance_streaming.py`（真 adapter 代码 + 真 API：草稿行/同 seq 编辑/定稿并附件/
+扫尾擦光标放租约/严格编辑 409/无锚点兜底开草稿），本机 dev server 上
+**通过 38 项 / 失败 0 项**（2026-09-22；此前 24 项）。线上真机也核过一轮：网关日志出现
+`[Runone] 流式草稿已开`，轮询能看到 `draft` 长度在长、`seq` 不变，定稿后是**同一条** `replied` 行、
+正文完整、无残留光标。跑法见脚本头部注释；服务端口径与取证记录在 monorepo 的
+`docs/ai-channel-design.md` §20/§21。
 
 ## 行为口径（2026-09-17，生产事故后补的）
 
@@ -168,7 +186,8 @@ RUNONE_BASE_URL=https://runone-api.capdien.site RUNONE_TOKEN=rn_… \
 
 ## 还没做（对应设计文档的批二 / 批三）
 
-- 流式回复的**适配器接线**（服务端与前端已就绪：草稿行 + `PATCH /ai/messages/:id`）；
+- 逐字流式已接线（2026-09-20）；**按工具边界分段**（网关行为，非缺陷）：模型在工具调用前先说话时，
+  那段话会定稿成一条独立气泡、正文再起一条 —— 要「整轮一条气泡」得改服务端把分段并回同一行，未做；
 - 工具进度（「正在执行「create_task」…」）、未读/已读、会话深链 `/ai?conversation=<id>`；
 - 附件 / 语音（音频附件 → 本机 whisper）、clarify 与危险命令审批渲染成原生按钮；
 - 游标持久化（现在是内存变量，重启重扫；批二接 `plugin_db("runone")`）；
