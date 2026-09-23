@@ -17,6 +17,9 @@
  10. **入站被前置写入置成 replied 时也能开出草稿**：中间态写入（工具进度 / 提示）不消耗锚点、
      不把入站置 replied；`/reply` 被 409 挡住时走会话消息端点那条路开草稿，逐字流式照旧生效，
      定稿后入站租约照旧放掉。
+ 11. **语音晚到不跨轮**：手上有**本轮**待合并语音时流式草稿照样开（旧行为是被挤成整段发送）；
+     定稿把本轮语音并进同一条；这一轮**收口之后**才到（TTS 慢）的语音补挂到本轮那条正文上，
+     不新开一条同文消息、也不留给下一轮；上一轮遗留的语音在新一轮开始时立刻单独投递。
 
 跑法（**先起本机 dev server，端口别占并行会话的 8787/5173/8642**）：
 
@@ -129,6 +132,7 @@ async def main() -> int:
     ap.add_argument("--email", default="streaming-acceptance@runone.local")
     ap.add_argument("--name", default="流式验收账号")
     ap.add_argument("--keep", action="store_true", help="跑完不删测试会话（排障用）")
+    ap.add_argument("--persist", default="", help="wrangler `--persist-to` 目录（与你跑着的 dev server 必须一致，否则改的是另一个库）")
     args = ap.parse_args()
 
     repo = Path(args.repo)
@@ -240,7 +244,10 @@ async def main() -> int:
 
         print("\n[4] 定稿 → 转 replied + 入站 replied + 附件并进同一条")
         fake_attachment = "11111111-2222-4333-8444-555555555555"  # 附件入库走存储层，这里只验「并进同一条」这条写入契约
-        adapter._pending_voice[conv_id] = {"attachmentId": fake_attachment, "caption": "", "at": time.monotonic()}
+        # `inbound` 必须写**本轮**那条：跨轮的语音一律不并（见 [11]），拿不到就退化成单独投递。
+        adapter._pending_voice[conv_id] = {
+            "attachmentId": fake_attachment, "caption": "", "at": time.monotonic(), "inbound": inbound_id
+        }
         final = await adapter.edit_message(conv_id, draft_id, "最终正文（定稿）", finalize=True)
         check("[4] edit_message(finalize=True) 成功", bool(final.success), f"success={final.success} err={final.error}")
         page = await messages()
@@ -327,7 +334,7 @@ async def main() -> int:
         stale = await adapter.send(conv_id, "半截草稿（没有定稿） ▉", metadata={"expect_edits": True})
         stale_id = str(stale.message_id or "")
         check("[7] 第二条草稿已开出", bool(stale_id), f"id={stale_id}")
-        age = await _age_out_draft(repo, stale_id)
+        age = await _age_out_draft(repo, stale_id, args.persist)
         check("[7] 把 updated_at 改老（模拟进程被杀）", age, "wrangler d1 update")
         page = await messages()
         row = next((m for m in page.get("data", []) if m.get("id") == stale_id), None)
@@ -339,6 +346,66 @@ async def main() -> int:
         check("[7] 入站消息被放掉（不再挂着等 sweepStaleProcessing 判 failed）",
               bool(inb2) and inb2.get("status") == "replied", f"status={inb2.get('status') if inb2 else None}")
         check("[7] 之后 draft 归 null", page.get("draft") is None, f"draft={page.get('draft')}")
+
+        print("\n[11] 语音晚到：只补挂到本轮正文，不再多发一条（2026-09-23 线上报障）")
+        # 线上形态：TTS 合成慢于正文回写 → 语音到达时这一轮已经定稿收口。老代码把它压进
+        # `_pending_voice` 等「下一笔正文」，于是它跨到下一轮、错挂到下一问的回复上，还因为
+        # 「手上有待合并语音就不开流式草稿」把下一轮的逐字流式整条挤掉 —— 线上实测是一个半截
+        # 带光标的气泡 + 两条内容重复的正文（一条带语音、一条不带）。
+        res = await user_client.post(f"/ai/conversations/{conv_id}/messages",
+                                     json={"role": "user", "text": "流式验收：手上有待合并语音"})
+        inbound5 = (res.json() or {}).get("id", "")
+        await adapter._post(f"/ai/messages/{inbound5}/claim", {})
+        use_inbound(inbound5)
+        voice_a = "aaaaaaaa-1111-4111-8111-111111111111"
+        adapter._pending_voice[conv_id] = {
+            "attachmentId": voice_a, "caption": "", "at": time.monotonic(), "inbound": inbound5
+        }
+        draft3 = await adapter.send(conv_id, "首片（手上有本轮待合并语音）", metadata={"expect_edits": True})
+        page = await messages()
+        check("[11] 手上有本轮待合并语音时，流式草稿照开（旧行为：被挤成整段发送）",
+              bool(draft3.message_id) and (page.get("draft") or {}).get("id") == draft3.message_id,
+              f"id={draft3.message_id} draft={(page.get('draft') or {}).get('id')}")
+        fin3 = await adapter.edit_message(conv_id, str(draft3.message_id), "这一轮的正文（带语音）", finalize=True)
+        page = await messages()
+        row3 = next((m for m in page.get("data", []) if m.get("id") == draft3.message_id), None)
+        check("[11] 定稿把本轮语音并进了同一条正文",
+              bool(fin3.success) and bool(row3) and voice_a in (row3.get("attachmentIds") or []),
+              f"attachments={row3.get('attachmentIds') if row3 else None}")
+
+        # 收口之后才到的语音（这次走真上传）：补挂到本轮那条正文，不新开一条消息
+        rows_before = len(page.get("data", []))
+        audio = Path(os.environ.get("TEMP", "/tmp")) / "runone-acceptance-voice.wav"
+        _write_tiny_wav(audio)
+        sent = await adapter.send_voice(conv_id, str(audio))
+        real_att = str((sent.raw_response or {}).get("attachmentId") or "")
+        check("[11] 收口后到达的语音上传成功", bool(sent.success and real_att), f"success={sent.success} att={real_att}")
+        page = await messages()
+        row_after = next((m for m in page.get("data", []) if m.get("id") == str(draft3.message_id)), None)
+        check("[11] 补挂到本轮正文：附件挂上、正文一字不动",
+              bool(row_after) and real_att in (row_after.get("attachmentIds") or [])
+              and row_after.get("text") == "这一轮的正文（带语音）",
+              f"attachments={row_after.get('attachmentIds') if row_after else None}")
+        check("[11] 没有因此多出一条同文消息（旧行为：再发一条完整正文）",
+              len(page.get("data", [])) == rows_before,
+              f"rows {rows_before} → {len(page.get('data', []))}")
+        check("[11] 也没有压进 `_pending_voice` 去等下一轮", conv_id not in adapter._pending_voice,
+              f"pending={list(adapter._pending_voice)}")
+
+        # 跨轮遗留的语音（上一轮没等到正文）：新一轮开始时立刻单独投递，不再错挂到这一问
+        stale_voice = "bbbbbbbb-2222-4222-8222-222222222222"
+        adapter._pending_voice[conv_id] = {
+            "attachmentId": stale_voice, "caption": "", "at": time.monotonic(),
+            "inbound": "00000000-0000-4000-8000-000000000000",
+        }
+        await adapter._drop_stale_turn_voice(conv_id, inbound5)
+        page = await messages()
+        dropped = [m for m in page.get("data", []) if stale_voice in (m.get("attachmentIds") or [])]
+        check("[11] 跨轮遗留的语音被立刻单独投递（不再留给下一轮正文合并）", len(dropped) == 1,
+              f"rows={[(m.get('seq'), m.get('attachmentIds')) for m in page.get('data', [])]}")
+        check("[11] 投递后登记已清空（不会重复投）", conv_id not in adapter._pending_voice)
+        if real_att:
+            await user_client.delete(f"/attachments/{real_att}")
     finally:
         print("\n[8] 清理")
         if conv_id and not args.keep:
@@ -357,13 +424,28 @@ async def main() -> int:
     return 0 if FAIL == 0 else 1
 
 
-async def _age_out_draft(repo: Path, message_id: str) -> bool:
+def _write_tiny_wav(path: Path) -> None:
+    """0.2s 静音 wav —— [11] 只关心「附件上传后挂到哪条消息」，不关心音频内容。"""
+    import struct
+    import wave
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as fh:
+        fh.setnchannels(1)
+        fh.setsampwidth(2)
+        fh.setframerate(8000)
+        fh.writeframes(struct.pack("<800h", *([0] * 800)))
+
+
+async def _age_out_draft(repo: Path, message_id: str, persist: str = "") -> bool:
     """把草稿行的 updated_at 改到 20 分钟前（扫尾门槛是 10 分钟），验「没人定稿也会收口」。"""
     import subprocess
 
     old = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - 1200))
-    cmd = ["npx", "wrangler", "d1", "execute", "runone-app-db", "--local",
-           "--command", f"update ai_messages set updated_at = '{old}' where id = '{message_id}'"]
+    cmd = ["npx", "wrangler", "d1", "execute", "runone-app-db", "--local"]
+    if persist:
+        cmd += ["--persist-to", persist]
+    cmd += ["--command", f"update ai_messages set updated_at = '{old}' where id = '{message_id}'"]
     out = subprocess.run(cmd, cwd=str(repo / "apps" / "server"), capture_output=True, text=True,
                          shell=os.name == "nt")
     return out.returncode == 0

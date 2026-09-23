@@ -200,8 +200,15 @@ class RunoneAdapter(BasePlatformAdapter):
         self._voice_enabled: Dict[str, bool] = {}
         # 入站消息 id → 上次续租的时刻（单调钟）：typing 心跳顺带续租，别每 2s 打一次
         self._lease_touched: Dict[str, float] = {}
-        # chat_id(会话 id) → 已上传但还没挂上文字的语音附件（见 send_voice：正文与音频合并成一条消息）
+        # chat_id(会话 id) → 已上传但还没挂上文字的语音附件（见 send_voice：正文与音频合并成一条消息）。
+        # 条目带 `inbound`（属于哪一轮入站消息）：语音**只与本轮正文合并**，跨轮的一律立刻单独投递
+        # ——否则它会挂到下一问的回复上，且因为「手上有待合并语音就不开流式草稿」把下一轮的逐字流式
+        # 整条挤掉（线上实测：一条半截带光标的气泡 + 两条内容重复的正文，一条有语音一条没有）。
         self._pending_voice: Dict[str, Dict[str, Any]] = {}
+        # chat_id(会话 id) → 本轮**已经发出去的那条正文**（id / inbound / text）。
+        # 用途：TTS 比正文回写慢，语音到达时这一轮往往已经定稿；此时把附件补挂到那条正文上
+        # （`PATCH` 正文不动、只加附件），而不是再发一条同文消息。
+        self._last_reply: Dict[str, Dict[str, Any]] = {}
         # chat_id(会话 id) → 本轮流式草稿的助手行 id（服务端 status='streaming' 那条）。
         # 有它就意味着「这一轮的回复已经长在界面上了」，后面的写入走编辑/定稿而不是新开一条。
         self._draft_rows: Dict[str, str] = {}
@@ -269,6 +276,7 @@ class RunoneAdapter(BasePlatformAdapter):
         self._voice_enabled.clear()
         self._lease_touched.clear()
         self._pending_voice.clear()
+        self._last_reply.clear()
         self._draft_rows.clear()
         logger.info("[%s] Disconnected", self.name)
 
@@ -510,6 +518,10 @@ class RunoneAdapter(BasePlatformAdapter):
         author_name = item.get("authorName") or item.get("author_name")
         self._reply_anchor[conversation_id] = message_id
         self._turn_inbound[conversation_id] = message_id
+        # 新一轮开始：上一轮没等到正文的语音**不能再等下去**（等下去就是跨轮串台 —— 它会挂到
+        # 这一问的回复上，并让这一轮的流式草稿开不出来）。立刻单独投递，宁可两条也不能错挂。
+        await self._drop_stale_turn_voice(conversation_id, message_id)
+        self._last_reply.pop(conversation_id, None)
         # 「AI 回复带语音」由服务端按会话存（默认开）；旧后端不带这个字段时按开处理
         self._voice_enabled[conversation_id] = item.get("voiceReplies") is not False
 
@@ -636,8 +648,10 @@ class RunoneAdapter(BasePlatformAdapter):
 
         # ① 流式首片：网关带着 `expect_edits` 发来的分片 → 先建一条 `status='streaming'` 的草稿行，
         #    之后每片由 edit_message 改这一行（服务端的 draft 字段单给前端，增量里看不到它）。
-        #    带语音的轮次不走这条路：语音要跟正文合成一条，合并发生在最后的 send()/finalize 上。
-        if not self._pending_voice.get(chat_key) and bool(meta.get("expect_edits")) and inbound:
+        #    **手上有待合并的语音也要照开**：以前这里写成「有待合并语音就不开草稿」，
+        #    于是上一轮遗留的语音会把下一轮的逐字流式整条挤掉（首片被当正式回复发出去、后续分片全 409）。
+        #    合并只发生在最后那一拍（`send()` 正文写入 / `edit_message(finalize=True)`）。
+        if bool(meta.get("expect_edits")) and inbound:
             draft = await self._open_draft(chat_key, anchor, inbound, content)
             if draft is not None:
                 return draft
@@ -657,7 +671,12 @@ class RunoneAdapter(BasePlatformAdapter):
 
         # 语音先到、正文随后：**合并成一条消息**（正文 + 音频附件）。
         # 分成两条时，只要文字那条失败，界面上就只剩一个没有正文的语音条 —— 看着像「没回复」。
+        # **只合并本轮的语音**：`inbound` 对不上说明它是上一轮遗留（上一轮正文早已定稿，答案已经发出去了），
+        # 挂到这一轮的正文上就是错挂，立刻单独投递。
         voice = self._pending_voice.pop(chat_key, None)
+        if voice and str(voice.get("inbound") or "") != str(inbound or ""):
+            await self._post_voice_alone(chat_key, voice)
+            voice = None
         if voice and voice.get("attachmentId"):
             payload["attachmentIds"] = [voice["attachmentId"]]
 
@@ -670,6 +689,12 @@ class RunoneAdapter(BasePlatformAdapter):
         self._draft_rows.pop(chat_key, None)
         self._reply_anchor.pop(chat_key, None)  # 一条入站消息一条回复
         self._lease_touched.pop(anchor, None)
+        # 记下「本轮已经发出去的那条正文」：语音若比它更晚到，附件补挂到这一条上（不再发同文消息）
+        self._last_reply[chat_key] = {
+            "id": str(data.get("id") or ""),
+            "inbound": str(inbound or ""),
+            "text": content,
+        }
         if draft_open or bool(meta.get("notify")):
             # 这一笔就是本轮的回复（定稿了那条草稿行 / 网关标了 notify 的终答）→ 整轮收口
             self._release_turn(chat_key)
@@ -694,7 +719,12 @@ class RunoneAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="adapter 未连接")
         chat_key = str(chat_id)
         payload: Dict[str, Any] = {"text": content, "finalize": bool(finalize)}
+        inbound = str(self._turn_inbound.get(chat_key) or "")
         voice = self._pending_voice.pop(chat_key, None) if finalize else None
+        if voice and str(voice.get("inbound") or "") != inbound:
+            # 上一轮遗留的语音：这一轮的正文不是它的答案，别并进来（错挂比多一条更糟）
+            await self._post_voice_alone(chat_key, voice)
+            voice = None
         if voice and voice.get("attachmentId"):
             payload["attachmentIds"] = [voice["attachmentId"]]
 
@@ -725,6 +755,12 @@ class RunoneAdapter(BasePlatformAdapter):
             anchor = self._reply_anchor.pop(chat_key, None)
             self._lease_touched.pop(anchor, None)
             self._release_turn(chat_key)
+            # 记下本轮已定稿的那条正文：语音更晚到时补挂到它上面（见 `send_voice`）
+            self._last_reply[chat_key] = {
+                "id": str(data.get("id") or message_id),
+                "inbound": inbound,
+                "text": content,
+            }
         return SendResult(success=True, message_id=str(data.get("id") or message_id), raw_response=data)
 
     async def send_voice(
@@ -783,11 +819,19 @@ class RunoneAdapter(BasePlatformAdapter):
         # 为什么改：以前语音单独写一条消息，回写失败时就留下「只有语音、没有正文」的假回复
         # （生产实测：用户以为 Hermes 没回）。合并后要么整条到，要么整条不到。
         # 同一个会话里上一轮还没合并的语音先落地，避免被这一条顶掉。
-        await self._flush_stale_voice(str(chat_id), force=True)
-        self._pending_voice[str(chat_id)] = {
+        chat_key = str(chat_id)
+        await self._flush_stale_voice(chat_key, force=True)
+        # TTS 比正文慢：语音常常**晚于这一轮的正文**到达，甚至这一轮已经定稿收口。
+        # 那种情况下不能再等「下一笔正文」——等下去要么被下一轮吞掉（错挂到别的问答上），
+        # 要么让下一轮再发一条同文消息（线上实测：同一条回复出现两条，一条带语音一条不带）。
+        # 正确落点是本轮那条正文：**只补附件、正文不动**。
+        if await self._attach_voice_to_last_reply(chat_key, attachment_id):
+            return SendResult(success=True, message_id="", raw_response={"attachmentId": attachment_id})
+        self._pending_voice[chat_key] = {
             "attachmentId": attachment_id,
             "caption": (caption or "").strip(),
             "at": time.monotonic(),
+            "inbound": str(self._turn_inbound.get(chat_key) or ""),
         }
         logger.info("[%s] voice: 附件已上传 %s（%d 字节），等正文合并成一条消息", self.name, attachment_id, len(audio))
         return SendResult(success=True, message_id="", raw_response={"attachmentId": attachment_id})
@@ -803,20 +847,75 @@ class RunoneAdapter(BasePlatformAdapter):
             if not force and now - float(item.get("at") or 0.0) < VOICE_MERGE_TIMEOUT_SECONDS:
                 continue
             self._pending_voice.pop(cid, None)
-            data = await self._request(
-                "POST",
-                f"/ai/conversations/{cid}/messages",
-                {
-                    "role": "assistant",
-                    "text": str(item.get("caption") or ""),
-                    "attachmentIds": [item["attachmentId"]],
-                    "clientMsgId": f"hermes-voice-{uuid.uuid4().hex}",
-                },
+            await self._post_voice_alone(cid, item)
+
+    async def _post_voice_alone(self, chat_key: str, item: Dict[str, Any]) -> None:
+        """把一条无法与正文合并的语音单独投递（宁可两条，也不能丢音频）。"""
+        data = await self._request(
+            "POST",
+            f"/ai/conversations/{chat_key}/messages",
+            {
+                "role": "assistant",
+                "text": str(item.get("caption") or ""),
+                "attachmentIds": [item["attachmentId"]],
+                "clientMsgId": f"hermes-voice-{uuid.uuid4().hex}",
+            },
+        )
+        if data is None:
+            logger.warning(
+                "[%s] voice: 单独投递语音附件 %s 失败（附件已上传，未挂到消息）", self.name, item.get("attachmentId")
             )
-            if data is None:
-                logger.warning("[%s] voice: 单独投递语音附件 %s 失败（附件已上传，未挂到消息）", self.name, item.get("attachmentId"))
-            else:
-                logger.info("[%s] voice: 没等到正文，已单独投递语音附件 %s", self.name, item.get("attachmentId"))
+        else:
+            logger.info(
+                "[%s] voice: 没等到正文，已单独投递语音附件 %s", self.name, item.get("attachmentId")
+            )
+
+    async def _drop_stale_turn_voice(self, chat_key: str, inbound: str) -> None:
+        """新一轮开始时，把上一轮遗留的待合并语音就地投递掉。
+
+        为什么不能留：留下的那条会被「这一轮的正文」当成待合并附件取走 —— 上一问的答案挂到
+        这一问的回复上（错挂），而且它还会把这一轮的流式草稿挤掉（旧 `send()` 的判定条件）。
+        """
+        item = self._pending_voice.get(chat_key)
+        if not item or str(item.get("inbound") or "") == str(inbound or ""):
+            return
+        self._pending_voice.pop(chat_key, None)
+        logger.info(
+            "[%s] voice: 上一轮遗留的附件 %s 不再跨轮等待 —— 立刻单独投递", self.name, item.get("attachmentId")
+        )
+        await self._post_voice_alone(chat_key, item)
+
+    async def _attach_voice_to_last_reply(self, chat_key: str, attachment_id: str) -> bool:
+        """把语音补挂到**本轮已经发出去的那条正文**上（正文一字不动，只加附件）。
+
+        什么时候走到这里：TTS 合成慢于正文回写，`send_voice` 被调用时这一轮已经定稿收口
+        （`_turn_inbound` 已释放、`_last_reply` 里还剩本轮那条正文）。这时如果按老办法压进
+        `_pending_voice` 等下一笔正文，就会出现「同一条回复两条、一条带语音一条不带」。
+
+        服务端对这一支的口径：已定稿行**正文相同、只补附件** → 200 并把附件并进去；
+        正文不同仍 409。旧服务端会回 200「成功但什么都不改」，所以这里**必须回读附件列表**
+        来判定真的挂上了，不能只看 HTTP 状态（否则语音会静默消失）。
+        """
+        last = self._last_reply.get(chat_key) or {}
+        reply_id = str(last.get("id") or "")
+        if not reply_id or self._turn_inbound.get(chat_key):
+            return False  # 本轮还没收口（正文随后会自己带附件）或没有可挂的正文
+        status, data = await self._request_status(
+            "PATCH",
+            f"/ai/messages/{reply_id}",
+            {"text": str(last.get("text") or ""), "attachmentIds": [attachment_id]},
+            quiet=True,
+        )
+        attached = data is not None and attachment_id in (data.get("attachmentIds") or [])
+        if attached:
+            logger.info(
+                "[%s] voice: 附件 %s 已补挂到本轮回复 %s（正文不动）", self.name, attachment_id, reply_id
+            )
+        else:
+            logger.info(
+                "[%s] voice: 补挂到本轮回复失败（status=%s）——改为单独投递", self.name, status
+            )
+        return attached
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """typing 是心跳式的：服务端 5s 过期，网关的 _keep_typing 每 2s 会调到这里。
