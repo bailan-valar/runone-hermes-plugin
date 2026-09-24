@@ -374,4 +374,19 @@ TOOLS = [{'name': 'list_today_tasks',
                                 'date': {'description': '发生日 YYYY-MM-DD（默认今天）', 'type': 'string'}}}},
  {'name': 'list_my_account',
   'description': '查看当前 MCP 身份：账号的名字与邮箱、所属空间及角色；服务身份（部署者静态 token）会说明「不过滤、全权限」。用于确认「我现在以谁的身份在操作」，以及在收到「没有权限」时判断该找谁授权。',
-  'parameters': {'type': 'object'}}]
+  'parameters': {'type': 'object'}},
+ {'name': 'get_bootstrap_token',
+  'description': '替一个**新建的 AI 空间成员**领「引导令牌」（一次性明文）：用来给那个成员自己的 Hermes profile 写 .env。只有**个人秘书**的令牌能调，目标必须是你账号里可被指派的 '
+                 'AI 成员（不能是秘书自己）。拿到的明文**别再贴回会话**；那个 profile 建好后用 report_agent_binding 回报绑定。',
+  'parameters': {'type': 'object',
+                 'properties': {'member_id': {'type': 'string', 'description': '目标 AI 成员的 id（网页「成员」页里那个成员）'}},
+                 'required': ['member_id']}},
+ {'name': 'report_agent_binding',
+  'description': '回报「profile 已经建好了」：把某个 AI 空间成员的**专属大脑**写成 `机器/profile`（只写 agent_profile / '
+                 'agent_channel，不改它的角色与空间）。只有**个人秘书**的令牌能调。调完在会话里回一句结论（成功 / 失败 + 原因）。',
+  'parameters': {'type': 'object',
+                 'properties': {'member_id': {'type': 'string', 'description': '目标 AI 成员的 id'},
+                                'agent_profile': {'type': 'string',
+                                                  'description': '形如 home-win/worker-2：哪台机器的哪个 profile'},
+                                'agent_channel': {'description': '通道（可选）：feishu / weixin / local', 'type': 'string'}},
+                 'required': ['member_id', 'agent_profile']}}]

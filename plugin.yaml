@@ -1,7 +1,7 @@
 name: runone-platform
 label: RunOne
 kind: platform
-version: 0.5.1
+version: 0.6.0
 description: >
   RunOne plugin for Hermes Agent — two things behind one credential:
 
