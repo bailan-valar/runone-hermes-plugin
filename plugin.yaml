@@ -1,7 +1,7 @@
 name: runone-platform
 label: RunOne
 kind: platform
-version: 0.5.0
+version: 0.5.1
 description: >
   RunOne plugin for Hermes Agent — two things behind one credential:
 
@@ -27,7 +27,9 @@ author: RunOne
 provides_tools:
   - list_today_tasks
   - list_projects
-  - list_assigned_tasks
+  - create_test_case
+  - list_test_cases
+  - start_test_round
   - take_task
   - submit_task_result
   - find_tasks
