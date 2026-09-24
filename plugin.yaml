@@ -49,6 +49,8 @@ provides_tools:
   - update_recurrence
   - skip_occurrence
   - list_my_account
+  - get_bootstrap_token
+  - report_agent_binding
 requires_env:
   - name: RUNONE_BASE_URL
     description: "RunOne API base URL (no trailing slash). Production: https://runone-api.capdien.site ; local dev: http://127.0.0.1:8787"
